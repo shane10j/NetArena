@@ -1,3 +1,6 @@
 [submodule "amber"]
 	path = amber
 	url = https://github.com/RDI-Foundation/amber.git
+[submodule "netarena_leaderboard"]
+	path = netarena_leaderboard
+	url = https://github.com/shane10j/netarena_leaderboard.git
