@@ -10,6 +10,7 @@ from a2a.types import (
     AgentSkill,
 )
 
+from config import AgentConfig
 from executor import Executor
 
 
@@ -18,22 +19,30 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="URL to advertise in the agent card")
+    parser.add_argument(
+        "--role",
+        type=str,
+        default="coordinator",
+        choices=["coordinator", "planner", "verifier"],
+        help="Role this container should serve.",
+    )
     args = parser.parse_args()
+    config = AgentConfig.from_env(role=args.role)
 
-    # Fill in your agent card
-    # See: https://a2a-protocol.org/latest/tutorials/python/3-agent-skills-and-card/
-    
     skill = AgentSkill(
-        id="",
-        name="",
-        description="",
-        tags=[],
-        examples=[]
+        id=f"k8s_purple_{config.role}",
+        name=f"K8s Purple {config.role.title()}",
+        description="Coordinates Kubernetes benchmark investigation, action planning, and verification.",
+        tags=["kubernetes", "k8s", "purple-team", "agentx", config.role],
+        examples=[
+            "Investigate why a workload cannot reach an internal service.",
+            "Plan safe Kubernetes remediation steps and verify the result.",
+        ],
     )
 
     agent_card = AgentCard(
-        name="",
-        description="",
+        name=f"AgentX K8s Purple Agent ({config.role})",
+        description="A scaffolded multi-agent A2A purple agent for AgentX Kubernetes benchmarks.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
         default_input_modes=['text'],
@@ -43,7 +52,7 @@ def main():
     )
 
     request_handler = DefaultRequestHandler(
-        agent_executor=Executor(),
+        agent_executor=Executor(config),
         task_store=InMemoryTaskStore(),
     )
     server = A2AStarletteApplication(

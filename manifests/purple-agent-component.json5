@@ -1,0 +1,85 @@
+{
+  manifest_version: "0.3.0",
+
+  config_schema: {
+    type: "object",
+    properties: {
+      image: { type: "string" },
+      role: {
+        type: "string",
+        enum: ["coordinator", "planner", "verifier"],
+        default: "coordinator",
+      },
+      model_name: { type: "string", default: "gpt-4.1" },
+      litellm_api_key: { type: "string", secret: true },
+      litellm_api_base_url: { type: "string" },
+      litellm_api_version: { type: "string" },
+      log_level: { type: "string", default: "INFO" },
+    },
+    required: ["image"],
+    additionalProperties: false,
+  },
+
+  slots: {
+    llm: { kind: "llm", optional: true },
+    planner: { kind: "a2a", optional: true },
+    verifier: { kind: "a2a", optional: true },
+  },
+
+  program: {
+    image: "${config.image}",
+    entrypoint: [
+      "uv",
+      "run",
+      "src/server.py",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "9009",
+      "--role",
+      "${config.role}",
+    ],
+    env: {
+      AGENT_ROLE: "${config.role}",
+      MODEL_NAME: "${config.model_name}",
+      LITELLM_API_KEY: {
+        when: "config.litellm_api_key",
+        value: "${config.litellm_api_key}",
+      },
+      LITELLM_API_BASE_URL: {
+        when: "config.litellm_api_base_url",
+        value: "${config.litellm_api_base_url}",
+      },
+      LITELLM_API_VERSION: {
+        when: "config.litellm_api_version",
+        value: "${config.litellm_api_version}",
+      },
+      LLM_API_URL: {
+        when: "slots.llm.url",
+        value: "${slots.llm.url}",
+      },
+      PLANNER_AGENT_URL: {
+        when: "slots.planner.url",
+        value: "${slots.planner.url}",
+      },
+      VERIFIER_AGENT_URL: {
+        when: "slots.verifier.url",
+        value: "${slots.verifier.url}",
+      },
+      LOG_LEVEL: "${config.log_level}",
+    },
+    network: {
+      endpoints: [
+        { name: "a2a", port: 9009, protocol: "http" },
+      ],
+    },
+  },
+
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a" },
+  },
+
+  exports: {
+    a2a: "provides.a2a",
+  },
+}

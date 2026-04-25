@@ -1,20 +1,26 @@
-# A2A Agent Template
+# AgentX K8s Purple Agent
 
-A minimal template for building [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) agents.
+A scaffolded [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) agent for AgentX Phase 2
+Kubernetes purple-team benchmarks.
 
 ## Project Structure
 
 ```
 src/
-├─ server.py      # Server setup and agent card configuration
+├─ server.py      # Server setup, role selection, and agent card configuration
 ├─ executor.py    # A2A request handling
-├─ agent.py       # Your agent implementation goes here
+├─ agent.py       # Coordinator/planner/verifier control flow
+├─ llm.py         # LiteLLM adapter
+├─ roles.py       # Role prompts and metadata
+├─ config.py      # Runtime config from env/Amber
 └─ messenger.py   # A2A messaging utilities
+manifests/
+└─ purple-agent-component.json5 # Reusable Amber component manifest
 tests/
 └─ test_agent.py  # Agent tests
 Dockerfile            # Docker configuration
 pyproject.toml        # Python dependencies
-amber-manifest.json5  # Amber manifest
+amber-manifest.json5  # Amber root manifest wiring coordinator/planner/verifier
 .github/
 └─ workflows/
    └─ test-and-publish.yml # CI workflow
@@ -22,17 +28,17 @@ amber-manifest.json5  # Amber manifest
 
 ## Getting Started
 
-1. **Create your repository** - Click "Use this template" to create your own repository from this template
+1. **Implement the real K8s behaviors** - Extend [`src/agent.py`](src/agent.py) with the control
+   flow, tools, and prompts you want to compete with.
 
-2. **Implement your agent** - Add your agent logic to [`src/agent.py`](src/agent.py)
+2. **Configure model access** - The scaffold has a LiteLLM adapter in [`src/llm.py`](src/llm.py).
+   Add `litellm` to the project when you are ready for live model calls, then set `MODEL_NAME` and
+   `LITELLM_*` variables or bind the Amber `llm` slot during scenario orchestration.
 
-3. **Configure your agent card** - Fill in your agent's metadata (name, skills, description) in [`src/server.py`](src/server.py)
+3. **Set the image** - Replace the placeholder image in [`amber-manifest.json5`](amber-manifest.json5)
+   or provide it as Amber config.
 
-4. **Fill out your [Amber](https://github.com/RDI-Foundation/amber) manifest** - Update [`amber-manifest.json5`](amber-manifest.json5) to use your agent in Amber scenarios
-
-5. **Write your tests** - Add custom tests for your agent in [`tests/test_agent.py`](tests/test_agent.py)
-
-For a concrete example of implementing an agent using this template, see this [draft PR](https://github.com/RDI-Foundation/agent-template/pull/8).
+4. **Write benchmark-specific tests** - Add custom tests for your agent in [`tests/test_agent.py`](tests/test_agent.py).
 
 ## Running Locally
 
@@ -44,6 +50,12 @@ uv sync
 uv run src/server.py
 ```
 
+Run a specific role:
+
+```bash
+uv run src/server.py --role planner --port 9011
+```
+
 ## Running with Docker
 
 ```bash
@@ -52,6 +64,23 @@ docker build -t my-agent .
 
 # Run the container
 docker run -p 9009:9009 my-agent
+```
+
+The default container role is `coordinator`. Use `--role planner` or `--role verifier` to run helper
+containers from the same image.
+
+## Amber Layout
+
+[`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches three component
+instances from [`manifests/purple-agent-component.json5`](manifests/purple-agent-component.json5):
+`coordinator`, `planner`, and `verifier`. It binds the planner/verifier A2A exports into the
+coordinator and exports only the coordinator's A2A endpoint for the benchmark.
+
+Useful validation commands once Amber is available:
+
+```bash
+amber docs manifest
+amber check amber-manifest.json5
 ```
 
 ## Testing

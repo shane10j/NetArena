@@ -14,6 +14,7 @@ from a2a.utils import (
 )
 
 from agent import Agent
+from config import AgentConfig
 
 
 TERMINAL_STATES = {
@@ -25,7 +26,8 @@ TERMINAL_STATES = {
 
 
 class Executor(AgentExecutor):
-    def __init__(self):
+    def __init__(self, config: AgentConfig | None = None):
+        self.config = config or AgentConfig.from_env()
         self.agents: dict[str, Agent] = {} # context_id to agent instance
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
@@ -44,7 +46,7 @@ class Executor(AgentExecutor):
         context_id = task.context_id
         agent = self.agents.get(context_id)
         if not agent:
-            agent = Agent()
+            agent = Agent(self.config)
             self.agents[context_id] = agent
 
         updater = TaskUpdater(event_queue, task.id, context_id)
