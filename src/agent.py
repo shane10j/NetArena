@@ -103,7 +103,6 @@ class Agent:
     ) -> str:
         sections = [
             "Generate the Python implementation for the benchmark prompt below.",
-            "Do not use benchmark-private helper functions such as solid_step_*.",
             "Use only normal NetworkX graph operations and the provided graph_data object.",
             f"Benchmark prompt:\n{input_text}",
         ]
