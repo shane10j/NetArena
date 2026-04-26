@@ -19,6 +19,10 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to bind the server")
     parser.add_argument("--port", type=int, default=9009, help="Port to bind the server")
     parser.add_argument("--card-url", type=str, help="URL to advertise in the agent card")
+    parser.add_argument("--model-name", type=str, help="LiteLLM model name to serve")
+    parser.add_argument("--api-key", type=str, help="LiteLLM/OpenAI-compatible API key")
+    parser.add_argument("--api-base-url", type=str, help="LiteLLM/OpenAI-compatible base URL")
+    parser.add_argument("--api-version", type=str, help="API version for Azure-compatible endpoints")
     parser.add_argument(
         "--role",
         type=str,
@@ -27,22 +31,28 @@ def main():
         help="Role this container should serve.",
     )
     args = parser.parse_args()
-    config = AgentConfig.from_env(role=args.role)
+    config = AgentConfig.from_env(
+        role=args.role,
+        model_name=args.model_name,
+        litellm_api_key=args.api_key,
+        litellm_api_base_url=args.api_base_url,
+        litellm_api_version=args.api_version,
+    )
 
     skill = AgentSkill(
-        id=f"k8s_purple_{config.role}",
-        name=f"K8s Purple {config.role.title()}",
-        description="Coordinates Kubernetes benchmark investigation, action planning, and verification.",
-        tags=["kubernetes", "k8s", "purple-team", "agentx", config.role],
+        id=f"malt_purple_{config.role}",
+        name=f"MALT Purple {config.role.title()}",
+        description="Solves MALT data-center topology planning and NetworkX graph query tasks.",
+        tags=["malt", "networkx", "data-center", "planning", "agentbeats", config.role],
         examples=[
-            "Investigate why a workload cannot reach an internal service.",
-            "Plan safe Kubernetes remediation steps and verify the result.",
+            "Remove a named node from the graph and return the updated graph.",
+            "Rank children of a topology node by bandwidth and return the answer.",
         ],
     )
 
     agent_card = AgentCard(
-        name=f"AgentX K8s Purple Agent ({config.role})",
-        description="A scaffolded multi-agent A2A purple agent for AgentX Kubernetes benchmarks.",
+        name=f"NetArena MALT Purple Agent ({config.role})",
+        description="A basic multi-agent A2A purple agent for the NetArena MALT benchmark.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
         default_input_modes=['text'],

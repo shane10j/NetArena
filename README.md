@@ -1,7 +1,7 @@
-# AgentX K8s Purple Agent
+# NetArena MALT Purple Agent
 
-A scaffolded [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) agent for AgentX Phase 2
-Kubernetes purple-team benchmarks.
+A basic [A2A (Agent-to-Agent)](https://a2a-protocol.org/latest/) purple agent for the NetArena MALT
+data-center planning benchmark.
 
 ## Project Structure
 
@@ -9,13 +9,16 @@ Kubernetes purple-team benchmarks.
 src/
 ├─ server.py      # Server setup, role selection, and agent card configuration
 ├─ executor.py    # A2A request handling
-├─ agent.py       # Coordinator/planner/verifier control flow
+├─ agent.py       # Regular LLM coordinator/planner/verifier control flow
+├─ agent_old.py   # Archived benchmark-template experiment
 ├─ llm.py         # LiteLLM adapter
 ├─ roles.py       # Role prompts and metadata
 ├─ config.py      # Runtime config from env/Amber
 └─ messenger.py   # A2A messaging utilities
 manifests/
 └─ purple-agent-component.json5 # Reusable Amber component manifest
+docs/
+└─ multi_agent.md # Coordinator/planner/verifier extension guide
 tests/
 └─ test_agent.py  # Agent tests
 Dockerfile            # Docker configuration
@@ -28,12 +31,13 @@ amber-manifest.json5  # Amber root manifest wiring coordinator/planner/verifier
 
 ## Getting Started
 
-1. **Implement the real K8s behaviors** - Extend [`src/agent.py`](src/agent.py) with the control
-   flow, tools, and prompts you want to compete with.
+1. **Improve the MALT behavior** - Extend [`src/agent.py`](src/agent.py) and
+   [`src/roles.py`](src/roles.py) with stronger NetworkX graph reasoning, code generation, and
+   answer formatting.
 
-2. **Configure model access** - The scaffold has a LiteLLM adapter in [`src/llm.py`](src/llm.py).
-   Add `litellm` to the project when you are ready for live model calls, then set `MODEL_NAME` and
-   `LITELLM_*` variables or bind the Amber `llm` slot during scenario orchestration.
+2. **Configure model access** - The agent uses the LiteLLM adapter in [`src/llm.py`](src/llm.py).
+   Set `MODEL_NAME` and `LITELLM_*` variables or bind the Amber `llm` slot during scenario
+   orchestration.
 
 3. **Set the image** - Replace the placeholder image in [`amber-manifest.json5`](amber-manifest.json5)
    or provide it as Amber config.
@@ -69,7 +73,17 @@ docker run -p 9009:9009 my-agent
 The default container role is `coordinator`. Use `--role planner` or `--role verifier` to run helper
 containers from the same image.
 
-## Amber Layout
+## Multi-Agent Layout
+
+The current agent is an LLM-first implementation with optional multi-agent delegation:
+
+- `coordinator`: receives the benchmark prompt, asks the planner for a concise plan when configured,
+  drafts the final `process_graph(graph_data)` code with LiteLLM, asks the verifier to review it
+  when configured, and performs one revision if the verifier reports issues.
+- `planner`: produces a small implementation plan using ordinary NetworkX graph traversal and
+  mutation APIs.
+- `verifier`: checks the draft for executable Python, the expected return shape, graph-copy safety,
+  and accidental use of benchmark-private helper functions.
 
 [`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches three component
 instances from [`manifests/purple-agent-component.json5`](manifests/purple-agent-component.json5):
@@ -82,6 +96,125 @@ Useful validation commands once Amber is available:
 amber docs manifest
 amber check amber-manifest.json5
 ```
+
+You can also run the same pattern manually with three local processes:
+
+```bash
+uv run src/server.py --role planner --port 9011 --model-name openai/gpt-4.1
+uv run src/server.py --role verifier --port 9012 --model-name openai/gpt-4.1
+PLANNER_AGENT_URL=http://127.0.0.1:9011 \
+VERIFIER_AGENT_URL=http://127.0.0.1:9012 \
+uv run src/server.py --role coordinator --port 9009 --model-name openai/gpt-4.1
+```
+
+The same image can serve every role; only `--role` and the planner/verifier URLs change.
+
+## MALT Leaderboard Submission
+
+The [`netarena_leaderboard`](netarena_leaderboard) folder is the AgentBeats leaderboard repo for
+NetArena. MALT is the data-center planning benchmark: the green agent sends text prompts describing
+a NetworkX/MALT topology task, and the purple agent should answer with Python code or a direct
+answer that satisfies the prompt. This agent uses normal LLM-generated NetworkX code and keeps the
+older template-based experiment in `src/agent_old.py` for reference only.
+
+The leaderboard has two ways to identify agents:
+
+- `image = "..."` works for local testing only.
+- `agentbeats_id = "..."` is required in GitHub Actions submissions.
+
+### 1. Publish And Register The Agent
+
+Build and publish a Docker image for this repo, or let this repo's GitHub Actions publish one to
+GHCR after a push to `main` or a semver tag.
+
+```bash
+docker build -t ghcr.io/<your-user>/<your-repo>:latest .
+docker push ghcr.io/<your-user>/<your-repo>:latest
+```
+
+Then register the image as a purple agent on [AgentBeats](https://agentbeats.dev/). After
+registration, copy the purple agent ID from the agent page. The AgentBeats tutorial describes this
+as the "Register Agent" flow and exposes a "Copy agent ID" button.
+
+Make sure the Docker image is public or readable from the leaderboard workflow. If the image is in a
+private GHCR package, add a `GHCR_TOKEN` secret in your leaderboard fork with permission to pull it.
+
+### 2. Configure MALT
+
+For local testing, edit [`netarena_leaderboard/malt_scenario.toml`](netarena_leaderboard/malt_scenario.toml)
+to point at the image directly:
+
+```toml
+[[participants]]
+image = "ghcr.io/<your-user>/<your-repo>:latest"
+name = "malt_operator"
+env = {
+  OPENAI_API_KEY = "${OPENAI_API_KEY}",
+  OPENAI_API_BASE = "https://api.tokenfactory.nebius.com/v1/",
+  MODEL_NAME = "openai/gpt-4.1"
+}
+```
+
+For an actual leaderboard submission, use the AgentBeats ID instead:
+
+```toml
+[[participants]]
+agentbeats_id = "<your-purple-agent-id>"
+name = "malt_operator"
+env = {
+  OPENAI_API_KEY = "${OPENAI_API_KEY}",
+  OPENAI_API_BASE = "https://api.tokenfactory.nebius.com/v1/",
+  MODEL_NAME = "openai/gpt-4.1"
+}
+```
+
+The agent accepts both the reference server CLI flags (`--model-name`, `--api-key`,
+`--api-base-url`, `--api-version`) and env vars: `MODEL_NAME`, `OPENAI_API_KEY`, `OPENAI_API_BASE`,
+`AZURE_API_KEY`, `AZURE_API_BASE`, and the equivalent `LITELLM_*` names.
+
+Keep the existing MALT green agent and `[config]` section unless you intentionally want to change the
+evaluation size:
+
+```toml
+[green_agent]
+agentbeats_id = "019ba416-0462-7cf2-86f0-bf85123df8a4"
+env = { LOG_LEVEL = "INFO" }
+```
+
+### 3. Local Dry Run
+
+Install the leaderboard helper dependencies, generate the assessment compose file, and run it:
+
+```bash
+cd netarena_leaderboard
+python -m pip install tomli tomli-w pyyaml requests
+python generate_compose.py --scenario malt_scenario.toml --app malt
+cp .env.example .env
+# Fill in .env values such as OPENAI_API_KEY before running.
+docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
+```
+
+The generated files are ignored by the leaderboard repo: `docker-compose.yml`, `a2a-scenario.toml`,
+`.env.example`, `.env`, and `output/`. Results appear under `netarena_leaderboard/output/`.
+
+### 4. Submit To The Leaderboard
+
+Fork the NetArena leaderboard repo, enable GitHub Actions in the fork, and add any referenced secrets
+from `malt_scenario.toml` under **Settings -> Secrets and variables -> Actions**. Then commit and
+push only the MALT scenario change in that fork:
+
+```bash
+cd netarena_leaderboard
+git add malt_scenario.toml
+git commit -m "Submit MALT benchmark"
+git push
+```
+
+Pushing `malt_scenario.toml` triggers `.github/workflows/run-malt.yml`. The workflow resolves the
+green agent and participant images, runs `agentbeats-client`, records provenance, copies the scenario
+and result JSON into `submissions/` and `results/`, creates a submission branch, and prints a
+"Submit your results" pull-request link in the GitHub Actions summary. Open that PR against the
+leaderboard repo. Once it is merged, the AgentBeats leaderboard can pick up the new score.
 
 ## Testing
 
