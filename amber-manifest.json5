@@ -34,11 +34,23 @@
         log_level: "${config.log_level}",
       },
     },
-    verifier: {
+    coder: {
       manifest: "./manifests/purple-agent-component.json5",
       config: {
         image: "${config.image}",
-        role: "verifier",
+        role: "graph_programmer",
+        model_name: "${config.model_name}",
+        litellm_api_key: "${config.litellm_api_key}",
+        litellm_api_base_url: "${config.litellm_api_base_url}",
+        litellm_api_version: "${config.litellm_api_version}",
+        log_level: "${config.log_level}",
+      },
+    },
+    repair: {
+      manifest: "./manifests/purple-agent-component.json5",
+      config: {
+        image: "${config.image}",
+        role: "repair_agent",
         model_name: "${config.model_name}",
         litellm_api_key: "${config.litellm_api_key}",
         litellm_api_base_url: "${config.litellm_api_base_url}",
@@ -62,10 +74,12 @@
 
   bindings: [
     { to: "#planner.llm", from: "slots.llm", weak: true },
-    { to: "#verifier.llm", from: "slots.llm", weak: true },
+    { to: "#coder.llm", from: "slots.llm", weak: true },
+    { to: "#repair.llm", from: "slots.llm", weak: true },
     { to: "#coordinator.llm", from: "slots.llm", weak: true },
     { to: "#coordinator.planner", from: "#planner.a2a" },
-    { to: "#coordinator.verifier", from: "#verifier.a2a" },
+    { to: "#coordinator.coder", from: "#coder.a2a" },
+    { to: "#coordinator.repair", from: "#repair.a2a" },
   ],
 
   exports: {

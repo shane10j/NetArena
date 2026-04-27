@@ -11,7 +11,8 @@ class AgentConfig:
     litellm_api_base_url: str | None = None
     litellm_api_version: str | None = None
     planner_agent_url: str | None = None
-    verifier_agent_url: str | None = None
+    coder_agent_url: str | None = None
+    repair_agent_url: str | None = None
 
     @classmethod
     def from_env(
@@ -46,7 +47,8 @@ class AgentConfig:
                 or os.getenv("AZURE_API_VERSION")
             ),
             planner_agent_url=os.getenv("PLANNER_AGENT_URL"),
-            verifier_agent_url=os.getenv("VERIFIER_AGENT_URL"),
+            coder_agent_url=os.getenv("CODER_AGENT_URL"),
+            repair_agent_url=os.getenv("REPAIR_AGENT_URL"),
         )
 
     @property

@@ -27,7 +27,12 @@ def main():
         "--role",
         type=str,
         default="coordinator",
-        choices=["coordinator", "planner", "verifier"],
+        choices=[
+            "coordinator",
+            "planner",
+            "graph_programmer",
+            "repair_agent",
+        ],
         help="Role this container should serve.",
     )
     args = parser.parse_args()
@@ -52,7 +57,7 @@ def main():
 
     agent_card = AgentCard(
         name=f"NetArena MALT Purple Agent ({config.role})",
-        description="A basic multi-agent A2A purple agent for the NetArena MALT benchmark.",
+        description="A three-stage A2A purple agent for the NetArena MALT benchmark.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
         default_input_modes=['text'],

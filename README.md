@@ -9,8 +9,8 @@ data-center planning benchmark.
 src/
 ├─ server.py      # Server setup, role selection, and agent card configuration
 ├─ executor.py    # A2A request handling
-├─ agent.py       # Regular LLM coordinator/planner/verifier control flow
-├─ agent_old.py   # Archived benchmark-template experiment
+├─ agent.py       # Planner/template generator/deterministic repair control flow
+├─ agent_old.py   # Archived placeholder from an earlier experiment
 ├─ llm.py         # LiteLLM adapter
 ├─ roles.py       # Role prompts and metadata
 ├─ config.py      # Runtime config from env/Amber
@@ -18,12 +18,12 @@ src/
 manifests/
 └─ purple-agent-component.json5 # Reusable Amber component manifest
 docs/
-└─ multi_agent.md # Coordinator/planner/verifier extension guide
+└─ multi_agent.md # Typed multi-agent workflow guide
 tests/
 └─ test_agent.py  # Agent tests
 Dockerfile            # Docker configuration
 pyproject.toml        # Python dependencies
-amber-manifest.json5  # Amber root manifest wiring coordinator/planner/verifier
+amber-manifest.json5  # Amber root manifest wiring the role containers
 .github/
 └─ workflows/
    └─ test-and-publish.yml # CI workflow
@@ -70,25 +70,24 @@ docker build -t my-agent .
 docker run -p 9009:9009 my-agent
 ```
 
-The default container role is `coordinator`. Use `--role planner` or `--role verifier` to run helper
-containers from the same image.
+The default container role is `coordinator`. Use `--role planner`, `--role graph_programmer`, or
+`--role repair_agent` to run the other LLM stages from the same image.
 
 ## Multi-Agent Layout
 
-The current agent is an LLM-first implementation with optional multi-agent delegation:
+The current agent is a three-stage aligned implementation:
 
-- `coordinator`: receives the benchmark prompt, asks the planner for a concise plan when configured,
-  drafts the final `process_graph(graph_data)` code with LiteLLM, asks the verifier to review it
-  when configured, and performs one revision if the verifier reports issues.
-- `planner`: produces a small implementation plan using ordinary NetworkX graph traversal and
-  mutation APIs.
-- `verifier`: checks the draft for executable Python, the expected return shape, graph-copy safety,
-  and accidental use of benchmark-private helper functions.
+- `planner`: extracts a semantic JSON operation DSL.
+- template/code generator: deterministically emits plain NetworkX code for supported ops; the
+  `graph_programmer` LLM is used only for unsupported DSL operations.
+- deterministic semantic verifier/repair: validates the plan, checks syntax/schema, executes
+  semantic tests on synthetic graphs, and calls `repair_agent` once with exact failures.
+- `coordinator`: orchestrates the stages and exposes the public A2A endpoint.
 
-[`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches three component
-instances from [`manifests/purple-agent-component.json5`](manifests/purple-agent-component.json5):
-`coordinator`, `planner`, and `verifier`. It binds the planner/verifier A2A exports into the
-coordinator and exports only the coordinator's A2A endpoint for the benchmark.
+[`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches multiple component
+instances from [`manifests/purple-agent-component.json5`](manifests/purple-agent-component.json5).
+It binds the role A2A exports into the coordinator and exports only the coordinator's A2A endpoint
+for the benchmark.
 
 Useful validation commands once Amber is available:
 
@@ -97,25 +96,28 @@ amber docs manifest
 amber check amber-manifest.json5
 ```
 
-You can also run the same pattern manually with three local processes:
+You can also run the same pattern manually with three local LLM-stage processes:
 
 ```bash
 uv run src/server.py --role planner --port 9011 --model-name openai/gpt-4.1
-uv run src/server.py --role verifier --port 9012 --model-name openai/gpt-4.1
+uv run src/server.py --role graph_programmer --port 9012 --model-name openai/gpt-4.1
+uv run src/server.py --role repair_agent --port 9014 --model-name openai/gpt-4.1
 PLANNER_AGENT_URL=http://127.0.0.1:9011 \
-VERIFIER_AGENT_URL=http://127.0.0.1:9012 \
+CODER_AGENT_URL=http://127.0.0.1:9012 \
+REPAIR_AGENT_URL=http://127.0.0.1:9014 \
 uv run src/server.py --role coordinator --port 9009 --model-name openai/gpt-4.1
 ```
 
-The same image can serve every role; only `--role` and the planner/verifier URLs change.
+The same image can serve every role; only `--role` and the stage URLs change. See
+[`docs/multi_agent.md`](docs/multi_agent.md) for the full local Docker workflow.
 
 ## MALT Leaderboard Submission
 
 The [`netarena_leaderboard`](netarena_leaderboard) folder is the AgentBeats leaderboard repo for
 NetArena. MALT is the data-center planning benchmark: the green agent sends text prompts describing
 a NetworkX/MALT topology task, and the purple agent should answer with Python code or a direct
-answer that satisfies the prompt. This agent uses normal LLM-generated NetworkX code and keeps the
-older template-based experiment in `src/agent_old.py` for reference only.
+answer that satisfies the prompt. This agent uses LLM-generated NetworkX code, deterministic local
+checks, and staged repair before returning final code.
 
 The leaderboard has two ways to identify agents:
 

@@ -7,7 +7,12 @@
       image: { type: "string" },
       role: {
         type: "string",
-        enum: ["coordinator", "planner", "verifier"],
+        enum: [
+          "coordinator",
+          "planner",
+          "graph_programmer",
+          "repair_agent",
+        ],
         default: "coordinator",
       },
       model_name: { type: "string", default: "gpt-4.1" },
@@ -23,7 +28,8 @@
   slots: {
     llm: { kind: "llm", optional: true },
     planner: { kind: "a2a", optional: true },
-    verifier: { kind: "a2a", optional: true },
+    coder: { kind: "a2a", optional: true },
+    repair: { kind: "a2a", optional: true },
   },
 
   program: {
@@ -62,9 +68,13 @@
         when: "slots.planner.url",
         value: "${slots.planner.url}",
       },
-      VERIFIER_AGENT_URL: {
-        when: "slots.verifier.url",
-        value: "${slots.verifier.url}",
+      CODER_AGENT_URL: {
+        when: "slots.coder.url",
+        value: "${slots.coder.url}",
+      },
+      REPAIR_AGENT_URL: {
+        when: "slots.repair.url",
+        value: "${slots.repair.url}",
       },
       LOG_LEVEL: "${config.log_level}",
     },
