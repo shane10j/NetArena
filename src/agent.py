@@ -215,6 +215,7 @@ class Agent:
             "hello",
             "hi",
             "ping",
+            "ready",
             "health",
             "health check",
             "status",

@@ -51,3 +51,4 @@ async def test_conformance_ping_does_not_call_llm():
     agent = Agent(AgentConfig(role="coordinator", model_name="openai/example"))
 
     assert await agent.invoke("Hello") == "Agent is ready."
+    assert await agent.invoke("ready") == "Agent is ready."

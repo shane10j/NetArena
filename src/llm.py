@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import litellm
-
 from config import AgentConfig
 
 
@@ -14,6 +12,7 @@ class LLMClient:
             return None
 
         try:
+            import litellm
             from litellm import CustomStreamWrapper, ModelResponse, ModelResponseStream, acompletion
         except ImportError:
             return None
