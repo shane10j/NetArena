@@ -7,7 +7,7 @@
       image: { type: "string" },
       role: {
         type: "string",
-        enum: ["coordinator", "planner", "verifier"],
+        enum: ["coordinator", "planner", "proposer", "reviewer", "verifier"],
         default: "coordinator",
       },
       model_name: { type: "string", default: "gpt-4.1" },
@@ -23,6 +23,8 @@
   slots: {
     llm: { kind: "llm", optional: true },
     planner: { kind: "a2a", optional: true },
+    proposer: { kind: "a2a", optional: true },
+    reviewer: { kind: "a2a", optional: true },
     verifier: { kind: "a2a", optional: true },
   },
 
@@ -61,6 +63,14 @@
       PLANNER_AGENT_URL: {
         when: "slots.planner.url",
         value: "${slots.planner.url}",
+      },
+      PROPOSER_AGENT_URL: {
+        when: "slots.proposer.url",
+        value: "${slots.proposer.url}",
+      },
+      REVIEWER_AGENT_URL: {
+        when: "slots.reviewer.url",
+        value: "${slots.reviewer.url}",
       },
       VERIFIER_AGENT_URL: {
         when: "slots.verifier.url",

@@ -9,7 +9,7 @@ data-center planning benchmark.
 src/
 ├─ server.py      # Server setup, role selection, and agent card configuration
 ├─ executor.py    # A2A request handling
-├─ agent.py       # Regular LLM coordinator/planner/verifier control flow
+├─ agent.py       # Pure NetworkX coordinator/planner/proposer/reviewer control flow
 ├─ agent_old.py   # Archived benchmark-template experiment
 ├─ llm.py         # LiteLLM adapter
 ├─ roles.py       # Role prompts and metadata
@@ -18,12 +18,12 @@ src/
 manifests/
 └─ purple-agent-component.json5 # Reusable Amber component manifest
 docs/
-└─ multi_agent.md # Coordinator/planner/verifier extension guide
+└─ multi_agent.md # Coordinator/planner/proposer/reviewer extension guide
 tests/
 └─ test_agent.py  # Agent tests
 Dockerfile            # Docker configuration
 pyproject.toml        # Python dependencies
-amber-manifest.json5  # Amber root manifest wiring coordinator/planner/verifier
+amber-manifest.json5  # Amber root manifest wiring coordinator/planner/proposer/reviewer
 .github/
 └─ workflows/
    └─ test-and-publish.yml # CI workflow
@@ -70,24 +70,29 @@ docker build -t my-agent .
 docker run -p 9009:9009 my-agent
 ```
 
-The default container role is `coordinator`. Use `--role planner` or `--role verifier` to run helper
-containers from the same image.
+The default container role is `coordinator`. Use `--role planner`, `--role proposer`, or
+`--role reviewer` to run helper containers from the same image.
 
 ## Multi-Agent Layout
 
-The current agent is an LLM-first implementation with optional multi-agent delegation:
+The current agent is an LLM-first implementation with optional multi-agent delegation and a hard
+pure-NetworkX constraint:
 
 - `coordinator`: receives the benchmark prompt, asks the planner for a concise plan when configured,
-  drafts the final `process_graph(graph_data)` code with LiteLLM, asks the verifier to review it
-  when configured, and performs one revision if the verifier reports issues.
+  asks the proposer for final `process_graph(graph_data)` code, asks the reviewer to constrain it
+  to pure NetworkX helper-like behavior, and performs one revision if feedback reports issues.
 - `planner`: produces a small implementation plan using ordinary NetworkX graph traversal and
   mutation APIs.
-- `verifier`: checks the draft for executable Python, the expected return shape, graph-copy safety,
+- `proposer`: writes executable Python using only ordinary NetworkX/Python APIs.
+- `reviewer`: checks the draft for executable Python, the expected return shape, graph-copy safety,
   and accidental use of benchmark-private helper functions.
 
-[`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches three component
+The coordinator also runs a local static review that rejects Markdown fences, missing
+`process_graph(graph_data)`, and private helper references such as `solid_step_*`.
+
+[`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches four component
 instances from [`manifests/purple-agent-component.json5`](manifests/purple-agent-component.json5):
-`coordinator`, `planner`, and `verifier`. It binds the planner/verifier A2A exports into the
+`coordinator`, `planner`, `proposer`, and `reviewer`. It binds the helper A2A exports into the
 coordinator and exports only the coordinator's A2A endpoint for the benchmark.
 
 Useful validation commands once Amber is available:
@@ -101,13 +106,15 @@ You can also run the same pattern manually with three local processes:
 
 ```bash
 uv run src/server.py --role planner --port 9011 --model-name openai/gpt-4.1
-uv run src/server.py --role verifier --port 9012 --model-name openai/gpt-4.1
+uv run src/server.py --role proposer --port 9012 --model-name openai/gpt-4.1
+uv run src/server.py --role reviewer --port 9013 --model-name openai/gpt-4.1
 PLANNER_AGENT_URL=http://127.0.0.1:9011 \
-VERIFIER_AGENT_URL=http://127.0.0.1:9012 \
+PROPOSER_AGENT_URL=http://127.0.0.1:9012 \
+REVIEWER_AGENT_URL=http://127.0.0.1:9013 \
 uv run src/server.py --role coordinator --port 9009 --model-name openai/gpt-4.1
 ```
 
-The same image can serve every role; only `--role` and the planner/verifier URLs change.
+The same image can serve every role; only `--role` and the helper URLs change.
 
 ## MALT Leaderboard Submission
 

@@ -11,6 +11,8 @@ class AgentConfig:
     litellm_api_base_url: str | None = None
     litellm_api_version: str | None = None
     planner_agent_url: str | None = None
+    proposer_agent_url: str | None = None
+    reviewer_agent_url: str | None = None
     verifier_agent_url: str | None = None
 
     @classmethod
@@ -46,6 +48,8 @@ class AgentConfig:
                 or os.getenv("AZURE_API_VERSION")
             ),
             planner_agent_url=os.getenv("PLANNER_AGENT_URL"),
+            proposer_agent_url=os.getenv("PROPOSER_AGENT_URL"),
+            reviewer_agent_url=os.getenv("REVIEWER_AGENT_URL") or os.getenv("VERIFIER_AGENT_URL"),
             verifier_agent_url=os.getenv("VERIFIER_AGENT_URL"),
         )
 

@@ -27,7 +27,7 @@ def main():
         "--role",
         type=str,
         default="coordinator",
-        choices=["coordinator", "planner", "verifier"],
+        choices=["coordinator", "planner", "proposer", "reviewer", "verifier"],
         help="Role this container should serve.",
     )
     args = parser.parse_args()
@@ -42,7 +42,7 @@ def main():
     skill = AgentSkill(
         id=f"malt_purple_{config.role}",
         name=f"MALT Purple {config.role.title()}",
-        description="Solves MALT data-center topology planning and NetworkX graph query tasks.",
+        description="Solves MALT data-center topology tasks with pure NetworkX code generation.",
         tags=["malt", "networkx", "data-center", "planning", "agentbeats", config.role],
         examples=[
             "Remove a named node from the graph and return the updated graph.",
