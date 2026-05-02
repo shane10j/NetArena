@@ -29,4 +29,14 @@ uv run src/server.py --role reviewer --port 9013 --model-name openai/gpt-4.1
 PLANNER_AGENT_URL=http://127.0.0.1:9011 \
 PROPOSER_AGENT_URL=http://127.0.0.1:9012 \
 REVIEWER_AGENT_URL=http://127.0.0.1:9013 \
-uv run 
+uv run src/server.py --role coordinator --port 9009 --model-name openai/gpt-4.1
+```
+
+## Extending It
+
+Good next steps:
+
+- Add a `repairer` role that only fixes reviewer-reported syntax and return-shape issues.
+- Add a `graph_reasoner` role that writes a language-level plan for traversal and mutation logic.
+- Split model choice by role: use a cheaper model for planning/verifying and a stronger model for
+  final code generation.
