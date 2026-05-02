@@ -9,7 +9,7 @@ data-center planning benchmark.
 src/
 ├─ server.py      # Server setup, role selection, and agent card configuration
 ├─ executor.py    # A2A request handling
-├─ agent.py       # Planner/template generator/deterministic repair control flow
+├─ agent.py       # Planner/coder/reviewer LLM control flow
 ├─ agent_old.py   # Archived placeholder from an earlier experiment
 ├─ llm.py         # LiteLLM adapter
 ├─ roles.py       # Role prompts and metadata
@@ -75,13 +75,12 @@ The default container role is `coordinator`. Use `--role planner`, `--role graph
 
 ## Multi-Agent Layout
 
-The current agent is a three-stage aligned implementation:
+The current agent is a simple LLM-first multi-agent implementation:
 
-- `planner`: extracts a semantic JSON operation DSL.
-- template/code generator: deterministically emits plain NetworkX code for supported ops; the
-  `graph_programmer` LLM is used only for unsupported DSL operations.
-- deterministic semantic verifier/repair: validates the plan, checks syntax/schema, executes
-  semantic tests on synthetic graphs, and calls `repair_agent` once with exact failures.
+- `planner`: summarizes the task, extracts entities, and lists ordered graph operations.
+- `graph_programmer`: writes the final `process_graph(graph_data)` implementation from first principles.
+- `repair_agent`: reviews and patches the generated code once.
+- lightweight local checks: strip Markdown and reject obviously malformed code before returning it.
 - `coordinator`: orchestrates the stages and exposes the public A2A endpoint.
 
 [`amber-manifest.json5`](amber-manifest.json5) is a root manifest that launches multiple component
@@ -116,8 +115,8 @@ The same image can serve every role; only `--role` and the stage URLs change. Se
 The [`netarena_leaderboard`](netarena_leaderboard) folder is the AgentBeats leaderboard repo for
 NetArena. MALT is the data-center planning benchmark: the green agent sends text prompts describing
 a NetworkX/MALT topology task, and the purple agent should answer with Python code or a direct
-answer that satisfies the prompt. This agent uses LLM-generated NetworkX code, deterministic local
-checks, and staged repair before returning final code.
+answer that satisfies the prompt. This agent uses LLM-generated NetworkX code with one reviewer pass
+before returning final code.
 
 The leaderboard has two ways to identify agents:
 
