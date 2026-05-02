@@ -67,22 +67,3 @@
         litellm_api_key: "${config.litellm_api_key}",
         litellm_api_base_url: "${config.litellm_api_base_url}",
         litellm_api_version: "${config.litellm_api_version}",
-        log_level: "${config.log_level}",
-      },
-    },
-  },
-
-  bindings: [
-    { to: "#planner.llm", from: "slots.llm", weak: true },
-    { to: "#proposer.llm", from: "slots.llm", weak: true },
-    { to: "#reviewer.llm", from: "slots.llm", weak: true },
-    { to: "#coordinator.llm", from: "slots.llm", weak: true },
-    { to: "#coordinator.planner", from: "#planner.a2a" },
-    { to: "#coordinator.proposer", from: "#proposer.a2a" },
-    { to: "#coordinator.reviewer", from: "#reviewer.a2a" },
-  ],
-
-  exports: {
-    a2a: "#coordinator.a2a",
-  },
-}
