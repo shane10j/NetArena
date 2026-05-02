@@ -48,6 +48,7 @@ jobs:
       - name: Start agent container
         env:
             SECRETS_JSON: ${{ toJson(secrets) }}
+            IMAGE_TAG: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
             NEBIUS_API_KEY: ${{ secrets.NEBIUS_API_KEY }}
             MODEL_NAME: "openai/Qwen/Qwen3-Next-80B-A3B-Thinking"
             NEBIUS_API_BASE_URL: "https://api.tokenfactory.nebius.com/v1/"
@@ -64,7 +65,12 @@ jobs:
             echo "LITELLM_API_KEY=$NEBIUS_API_KEY"
             echo "LITELLM_API_BASE_URL=$NEBIUS_API_BASE_URL"
           } >> .env
-          docker run -d -p 9009:9009 --name agent-container --env-file .env $(echo "${{ steps.meta.outputs.tags }}" | head -n1) --host 0.0.0.0 --port 9009
+          if [ -z "$IMAGE_TAG" ]; then
+            echo "Docker metadata action did not produce an image tag." >&2
+            exit 1
+          fi
+          echo "Starting agent container from $IMAGE_TAG"
+          docker run -d -p 9009:9009 --name agent-container --env-file .env "$IMAGE_TAG" --host 0.0.0.0 --port 9009
           timeout 30 bash -c 'until curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null; do sleep 1; done'
 
       - name: Set up uv

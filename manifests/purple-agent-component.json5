@@ -73,23 +73,4 @@
         value: "${slots.reviewer.url}",
       },
       VERIFIER_AGENT_URL: {
-        when: "slots.verifier.url",
-        value: "${slots.verifier.url}",
-      },
-      LOG_LEVEL: "${config.log_level}",
-    },
-    network: {
-      endpoints: [
-        { name: "a2a", port: 9009, protocol: "http" },
-      ],
-    },
-  },
-
-  provides: {
-    a2a: { kind: "a2a", endpoint: "a2a" },
-  },
-
-  exports: {
-    a2a: "provides.a2a",
-  },
-}
+       
