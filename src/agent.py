@@ -36,6 +36,8 @@ class Agent:
         return await self._respond(input_text)
 
     async def _respond(self, input_text: str) -> str:
+        if self._is_conformance_ping(input_text):
+            return "Agent is ready."
         if self.role.name == "coordinator":
             return await self._coordinate(input_text)
         return await self._role_response(input_text)
@@ -207,6 +209,16 @@ class Agent:
             return text
         draft = text.split(marker, 1)[1]
         return draft.rsplit("\nReply with PASS", 1)[0]
+
+    def _is_conformance_ping(self, text: str) -> bool:
+        return text.strip().lower() in {
+            "hello",
+            "hi",
+            "ping",
+            "health",
+            "health check",
+            "status",
+        }
 
     def _fallback_response(self, input_text: str) -> str:
         return "\n".join(

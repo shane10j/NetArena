@@ -16,5 +16,4 @@ Without those slots, the same container still runs as a standalone coordinator.
 
 LLM access is intentionally isolated in `src/llm.py`. Configure it with `MODEL_NAME` plus the
 `LITELLM_*` variables, or bind an Amber `llm` slot so the component receives `LLM_API_URL`.
-If no model is configured, the agent returns a deterministic `process_graph(graph_data)` fallback
-so A2A conformance checks and Docker startup still work.
+If no model is configured, the age

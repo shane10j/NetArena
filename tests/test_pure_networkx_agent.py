@@ -1,6 +1,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from agent import Agent
@@ -42,3 +44,10 @@ def test_reviewer_extracts_draft_before_static_review():
 
     assert "solid_step_*" in review_prompt
     assert agent._local_review(agent._extract_review_draft(review_prompt)) == "PASS"
+
+
+@pytest.mark.asyncio
+async def test_conformance_ping_does_not_call_llm():
+    agent = Agent(AgentConfig(role="coordinator", model_name="openai/example"))
+
+    assert await agent.invoke("Hello") == "Agent is ready."
