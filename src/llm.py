@@ -39,4 +39,4 @@ class LLMClient:
             return response.choices[0].delta.content or ""
         if isinstance(response, ModelResponse):
             return response.choices[0].message.content or ""
-        return ""
+       

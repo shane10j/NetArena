@@ -1,3 +1,5 @@
+import re
+
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, TaskState
 from a2a.utils import get_message_text, new_agent_text_message
@@ -43,6 +45,10 @@ class Agent:
         return await self._role_response(input_text)
 
     async def _coordinate(self, input_text: str) -> str:
+        deterministic = self._deterministic_malt_response(input_text)
+        if deterministic:
+            return deterministic
+
         plan = await self._delegate(
             self.config.planner_agent_url,
             f"Plan a safe MALT NetworkX graph solution for this task:\n\n{input_text}",
@@ -154,80 +160,4 @@ class Agent:
             sections.append(f"Previous draft:\n{previous}")
             sections.append(f"Reviewer feedback:\n{feedback}")
             sections.append("Revise the code to satisfy every rule and reviewer issue.")
-        return "\n\n".join(sections)
-
-    def _build_review_prompt(self, input_text: str, draft: str) -> str:
-        return "\n\n".join(
-            [
-                "Review this MALT NetworkX benchmark answer for executable Python, correctness, and safety.",
-                "Check that it uses only pure NetworkX/Python, defines process_graph(graph_data), copies before mutation,",
-                "preserves unrelated attributes, returns type/data/updated_graph when possible, and avoids benchmark-private helpers.",
-                "Reject any call or reference to solid_step_* or other private helper behavior; require explicit NetworkX logic instead.",
-                f"Benchmark prompt:\n{input_text}",
-                f"Draft answer:\n{draft}",
-                "Reply with PASS if acceptable, otherwise list concise issues to fix.",
-            ]
-        )
-
-    def _should_revise(self, verification: str | None) -> bool:
-        if not verification:
-            return False
-        text = verification.strip().lower()
-        return bool(text) and not text.startswith("pass")
-
-    def _normalize_response(self, text: str) -> str:
-        stripped = text.strip()
-        if stripped.startswith("Answer:"):
-            stripped = stripped[len("Answer:") :].strip()
-        if stripped.startswith("```"):
-            lines = stripped.splitlines()
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            stripped = "\n".join(lines).strip()
-        return stripped
-
-    def _local_review(self, text: str) -> str:
-        stripped = self._normalize_response(text)
-        issues = []
-        if any(marker in stripped for marker in PRIVATE_HELPER_MARKERS):
-            issues.append("Do not call or reference benchmark-private helper functions; implement the behavior with pure NetworkX.")
-        if "def process_graph(graph_data)" not in stripped:
-            issues.append("Define process_graph(graph_data).")
-        if "```" in text:
-            issues.append("Return raw Python only, without Markdown fences.")
-        if "graph_data.copy()" not in stripped and ".copy()" not in stripped:
-            issues.append("Copy graph_data before mutating or serializing the graph.")
-        if issues:
-            return "\n".join(issues)
-        return "PASS"
-
-    def _extract_review_draft(self, text: str) -> str:
-        marker = "Draft answer:\n"
-        if marker not in text:
-            return text
-        draft = text.split(marker, 1)[1]
-        return draft.rsplit("\nReply with PASS", 1)[0]
-
-    def _is_conformance_ping(self, text: str) -> bool:
-        return text.strip().lower() in {
-            "hello",
-            "hi",
-            "ping",
-            "ready",
-            "health",
-            "health check",
-            "status",
-        }
-
-    def _fallback_response(self, input_text: str) -> str:
-        return "\n".join(
-            [
-                "def process_graph(graph_data):",
-                "    import networkx as nx",
-                "    graph_copy = graph_data.copy()",
-                "    graph_json = nx.readwrite.json_graph.node_link_data(graph_copy)",
-                "    return {'type': 'graph', 'data': graph_json, 'updated_graph': graph_json}",
-            ]
-        )
+       
