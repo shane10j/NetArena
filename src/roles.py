@@ -8,99 +8,77 @@ class RoleSpec:
     system_prompt: str
 
 
-GLOBAL_CONTRACT = """
-You solve MALT / NetArena-style NetworkX graph benchmark tasks.
-Return ONLY executable Python code. No markdown, no prose, no imports.
-Define exactly one public function: process_graph(graph_data).
-Assume nx is already available. The function must copy the input first with
-`graph_copy = graph_data.copy()` and must never mutate graph_data directly.
-Every return path must include type, data, and updated_graph. updated_graph must
-be nx.readwrite.json_graph.node_link_data(graph_copy). Graph data must be
-node-link JSON; text/count data must be a string.
+BASE_CONTRACT = """
+Return only executable Python code defining exactly one top-level function process_graph(graph_data),
+unless the role explicitly asks for JSON. No markdown, prose, or imports. Assume nx is already
+available. Inside process_graph, begin with graph_copy = graph_data.copy(). Any helper functions
+must be nested inside process_graph. Every return path must return a dict with keys type, data,
+updated_graph. updated_graph must be nx.readwrite.json_graph.node_link_data(graph_copy). Never
+return a raw NetworkX graph object as data. Never mutate graph_data. Do not use hidden/private/
+oracle/reference/grader/benchmark helpers, including names starting solid_step_, private_, oracle_,
+reference_, ground_truth_, expected_, benchmark_, grader_, or malt_. Use only ordinary NetworkX
+and Python builtins.
 """.strip()
 
-
-MALT_HELPER_RULES = """
-For canonical MALT operations, prefer the benchmark-provided primitives when they
-are available in the execution namespace:
-- solid_step_add_node_to_graph(graph_copy, {'type': EK_TYPE, 'name': name}, parent_node_name)
-- solid_step_remove_node_from_graph(graph_copy, child_node_name)
-- solid_step_list_child_nodes(graph_copy, {'type': parent_type_or_None, 'name': parent_name})
-- solid_step_rank_child_nodes(graph_copy, parent_node_name)
-- solid_step_counting_query(graph_copy, parent_node_object, {'type': child_type, 'name': None})
-These primitives match the benchmark state/action semantics better than ad-hoc
-NetworkX traversal. Use graph_copy, not graph_data. After removals, clean only
-isolated nodes created by the mutation. Always serialize updated_graph.
+GRAPH_SEMANTICS = """
+Robust MALT NetworkX rules: normalize names and types by lowercasing and removing spaces,
+punctuation, underscores, hyphens, and EK/RK prefixes. Match nodes by id and attrs such as name,
+label, displayName, title, hostname, elementType, type, kind, class, role, and deviceType. Node
+node-type attrs may be strings or lists. Edge data may be None, a string, a plain dict, or a
+dict-of-dicts for MultiGraphs; check isinstance(x, dict) before .get. Containment edges usually have
+relationship/rel/type/kind/name/key/label equal to RK_CONTAINS or CONTAINS after normalization.
+Support Graph, DiGraph, MultiGraph, and MultiDiGraph; use successors/predecessors only when they
+exist, otherwise neighbors. Scoped queries under/in/within/below a node require containment traversal
+from the scope and then filtering descendants. Count/list/show/find/what/which/how many/rank/top/
+total/sum/average/path are read-only unless explicit mutation verbs appear: add/create/update/remove/
+delete/move/connect/fix/configure/place/assign/modify. Read-only tasks must leave graph_copy
+unchanged. Mutation tasks must perform exactly the requested state transition and preserve unrelated
+nodes, edges, and attributes. Use deterministic ids and sorting. Parse numeric strings for capacity/
+rank/aggregate tasks. Avoid clear(), graph-wide relabeling, graph-wide overwrites, randomness,
+eval/exec, file/subprocess/network calls, and grader introspection.
 """.strip()
 
+CORRECTNESS_PROMPT = (BASE_CONTRACT + "\n\n" + GRAPH_SEMANTICS + "\n\n" +
+"You are the CORRECTNESS agent. Maximize benchmark correctness. Implement the exact requested graph operation fully and deterministically. Safety matters, but do not refuse or no-op a mutation that the task actually asks for.").strip()
 
-PLANNER_PROMPT = """
-Return JSON only. Extract the task into a small operation DSL with ops and
-final_answer_contract. Use operations ADD_CHILD, REMOVE_SUBTREE,
-COUNT_CHILDREN, LIST_CHILDREN, RANK, UPDATE_ATTR, QUERY_ATTR when possible.
-Preserve operation order: mutations first, then the requested query on the
-updated graph. Include target_name, target_type, parent_name, child_type_filter,
-attribute_name, return_type, and whether mutation is required.
+SAFETY_PROMPT = """
+You are the SAFETY agent. Return JSON only; do not write replacement code. Review the proposed
+MALT NetworkX solution for concrete safety and runtime risks while preserving correctness. Do not
+object to mutations explicitly required by the task. Flag private helper cheating, graph_data mutation,
+read-only tasks that mutate graph_copy, broad clear/remove/relabel/overwrite, .get on non-dict edge
+data, DiGraph-only traversal that may crash, missing schema, raw graph returns, and missing entity
+crashes. Use this JSON schema: {"read_only": true/false, "must_mutate": true/false, "fatal": [],
+"safety": [], "runtime": [], "correctness_risks": [], "revision_instructions": []}.
 """.strip()
 
-
-SOLVER_PROMPT = (GLOBAL_CONTRACT + "\n\n" + MALT_HELPER_RULES + """
-Write one complete process_graph implementation and nothing else.
-Prioritize hidden benchmark correctness, then safety. For known MALT prompt
-families, compile the prompt into the canonical helper calls instead of manually
-reimplementing graph traversal. Preserve unrelated graph state.
-""").strip()
-
-
-SEMANTIC_PROMPT = (GLOBAL_CONTRACT + "\n\n" + MALT_HELPER_RULES + """
-You are the semantic-correctness solver. Return code only. Preserve exact
-operation order, node names, EK_* types, and return shape. Use helper calls for
-add/remove/list/rank/count whenever possible.
-""").strip()
-
-
-INVARIANT_PROMPT = (GLOBAL_CONTRACT + "\n\n" + MALT_HELPER_RULES + """
-You are the safety-focused solver. Return code only. Copy graph first, mutate
-only requested targets, preserve unrelated state, serialize graph outputs, return
-count data as strings, and clean isolated nodes only after requested removals.
-""").strip()
-
-
-REPAIR_PROMPT = (GLOBAL_CONTRACT + "\n\n" + MALT_HELPER_RULES + """
-Repair the selected implementation with the smallest possible patch. Return code
-only. Fix syntax, schema, missing updated_graph, direct graph_data mutation, raw
-NetworkX graph returns, and unsafe removal cleanup while preserving semantics.
-""").strip()
-
+REPAIR_PROMPT = (BASE_CONTRACT + "\n\n" + GRAPH_SEMANTICS + "\n\n" +
+"Make the smallest possible correction for the listed mechanical issues. Preserve the algorithm and any required mutation.").strip()
 
 ROLE_SPECS = {
-    "coordinator": RoleSpec("coordinator", "Coordinates deterministic MALT templates and LLM fallback.", GLOBAL_CONTRACT),
-    "planner": RoleSpec("planner", "Extracts semantic graph-operation plans.", PLANNER_PROMPT),
-    "task_analyst": RoleSpec("task_analyst", "Alias for planner.", PLANNER_PROMPT),
-    "graph_programmer": RoleSpec("graph_programmer", "General MALT solver.", SOLVER_PROMPT),
-    "graph_solver": RoleSpec("graph_solver", "Direct MALT solver.", SOLVER_PROMPT),
-    "semantic_programmer": RoleSpec("semantic_programmer", "Semantic MALT solver.", SEMANTIC_PROMPT),
-    "invariant_programmer": RoleSpec("invariant_programmer", "Safety-preserving MALT solver.", INVARIANT_PROMPT),
-    "repair_agent": RoleSpec("repair_agent", "Minimally repairs MALT code.", REPAIR_PROMPT),
-    "critic": RoleSpec("critic", "Selects candidate JSON.", "Return JSON only: {'best_index': int, 'reason': str}."),
-    "arbiter": RoleSpec("arbiter", "Returns final MALT code.", SOLVER_PROMPT),
+    "coordinator": RoleSpec("coordinator", "Runs a two-agent correctness/safety MALT dialogue.", BASE_CONTRACT),
+    "correctness_agent": RoleSpec("correctness_agent", "Correctness-focused MALT solver.", CORRECTNESS_PROMPT),
+    "safety_agent": RoleSpec("safety_agent", "Safety-focused MALT reviewer.", SAFETY_PROMPT),
+    # Backward-compatible aliases used by older configs.
+    "graph_programmer": RoleSpec("graph_programmer", "Correctness-focused MALT solver.", CORRECTNESS_PROMPT),
+    "semantic_programmer": RoleSpec("semantic_programmer", "Correctness-focused MALT solver.", CORRECTNESS_PROMPT),
+    "invariant_programmer": RoleSpec("invariant_programmer", "Safety-focused MALT reviewer.", SAFETY_PROMPT),
+    "repair_agent": RoleSpec("repair_agent", "Minimal mechanical repairer.", REPAIR_PROMPT),
+    "arbiter": RoleSpec("arbiter", "Correctness-focused MALT solver.", CORRECTNESS_PROMPT),
+    "planner": RoleSpec("planner", "Safety-focused MALT reviewer.", SAFETY_PROMPT),
 }
 
-
 ROLE_ALIASES = {
-    "solver": "graph_solver",
-    "coder": "graph_programmer",
-    "programmer": "graph_programmer",
-    "planned_solver": "semantic_programmer",
-    "invariant_solver": "invariant_programmer",
-    "analyst": "task_analyst",
-    "analysis": "task_analyst",
-    "reviewer": "repair_agent",
+    "solver": "correctness_agent",
+    "coder": "correctness_agent",
+    "programmer": "correctness_agent",
+    "critic": "safety_agent",
+    "reviewer": "safety_agent",
+    "safety": "safety_agent",
+    "correctness": "correctness_agent",
     "repair": "repair_agent",
 }
 
 
 def get_role(role: str) -> RoleSpec:
     key = (role or "coordinator").strip()
-    canonical = ROLE_ALIASES.get(key, key)
-    return ROLE_SPECS.get(canonical, ROLE_SPECS["coordinator"])
+    return ROLE_SPECS.get(ROLE_ALIASES.get(key, key), ROLE_SPECS["coordinator"])

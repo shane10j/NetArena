@@ -1,8 +1,6 @@
 import ast
-import asyncio
 import json
 import re
-from dataclasses import dataclass
 
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, TaskState
@@ -14,41 +12,24 @@ from messenger import Messenger
 from roles import get_role
 
 
-PLAN_SCHEMA = """{
-  "task_summary": "one sentence",
-  "read_only": true,
-  "must_mutate": false,
-  "expected_return_type": "text | list | table | graph",
-  "entities": {
-    "names": ["explicit node names"],
-    "types": ["explicit EK_* or natural types"],
-    "attributes": ["explicit attributes"],
-    "scopes": ["parents / containers / query roots"]
-  },
-  "operations": ["ordered atomic state/action operations"],
-  "safety_invariants": ["preserve unrelated nodes, edges, attributes"]
-}"""
-
-
-@dataclass(frozen=True)
-class Candidate:
-    label: str
-    code: str
-    issues: tuple[str, ...]
-    hazards: tuple[str, ...]
-    score: float
+PRIVATE_HELPER_RE = re.compile(
+    r"\b(solid_step_[A-Za-z0-9_]*|private_[A-Za-z0-9_]*|oracle_[A-Za-z0-9_]*|"
+    r"reference_[A-Za-z0-9_]*|ground_truth_[A-Za-z0-9_]*|expected_[A-Za-z0-9_]*|"
+    r"benchmark_[A-Za-z0-9_]*|grader_[A-Za-z0-9_]*|malt_[A-Za-z0-9_]*)\b"
+)
 
 
 class Agent:
-    """Correctness-first MALT agent with lightweight safety discipline.
+    """Two-agent MALT solver.
 
-    The observed peak came from diversity + an arbiter. Regressions came from
-    aggressive safety gating, over-selection, and gratuitous repairs that either
-    rejected correct programs or rewrote them into weaker code. This version
-    returns to the peak-producing topology: plan/direct in parallel, two planned
-    specialists in parallel, then one synthesis arbiter. Safety is handled mainly
-    by prompt discipline and only truly mechanical contract checks; the coordinator
-    does not second-guess graph semantics with brittle heuristics.
+    The coordinator uses exactly two conceptual agents:
+      1) correctness_agent: writes the strongest self-contained NetworkX solution.
+      2) safety_agent: reviews the draft for unsafe graph changes and runtime hazards.
+
+    The correctness agent then revises using the safety critique.  Local checks are intentionally
+    lightweight: they block only mechanical invalidity, private-helper cheating, and obviously
+    dangerous operations.  This avoids the regressions caused by over-aggressive semantic gates
+    while still giving safety a dedicated pass.
     """
 
     def __init__(self, config: AgentConfig | None = None):
@@ -75,97 +56,63 @@ class Agent:
         return await self._role_response(input_text)
 
     async def _coordinate(self, input_text: str) -> str:
-        # Round 1: get a compact semantic plan while also producing an
-        # independent direct implementation. The direct candidate often wins
-        # when the plan is slightly wrong.
-        plan_task = asyncio.create_task(
-            self._run_stage(
-                role="task_analyst",
-                url=getattr(self.config, "planner_agent_url", None),
-                prompt=self._planner_prompt(input_text),
-            )
+        # Round 1: correctness agent produces the best attempt.  No planner/arbiter tournament:
+        # fewer moving parts, less synthesis drift, and a clearer dialogue with safety.
+        draft_raw = await self._run_stage(
+            role="correctness_agent",
+            url=getattr(self.config, "coder_agent_url", None),
+            prompt=self._correctness_prompt(input_text),
         )
-        direct_task = asyncio.create_task(
-            self._run_stage(
-                role="graph_programmer",
-                url=getattr(self.config, "coder_agent_url", None),
-                prompt=self._solver_prompt(input_text, "{}", "direct"),
-            )
+        draft = self._clean_code(draft_raw or "")
+
+        # Round 2: safety agent reviews. It returns critique only, not replacement code, so it
+        # cannot accidentally overwrite a correct algorithm with a conservative no-op.
+        critique_raw = await self._run_stage(
+            role="safety_agent",
+            url=getattr(self.config, "repair_agent_url", None),
+            prompt=self._safety_prompt(input_text, draft, self._issues(draft)),
         )
-        plan_raw, direct_raw = await asyncio.gather(plan_task, direct_task)
-        plan = self._normalize_json_response(plan_raw or "{}")
+        critique = self._normalize_json_response(critique_raw or "{}")
 
-        # Round 2: two complementary planned solvers. These are parallel to keep
-        # latency close to the previous high-performing version.
-        semantic_task = asyncio.create_task(
-            self._run_stage(
-                role="semantic_programmer",
-                url=getattr(self.config, "coder_agent_url", None),
-                prompt=self._solver_prompt(input_text, plan, "semantic"),
-            )
+        # Round 3: correctness agent revises to maximize correctness while fixing the concrete
+        # safety/runtime concerns.  This keeps correctness in control, with safety as a strong critic.
+        revised_raw = await self._run_stage(
+            role="correctness_agent",
+            url=getattr(self.config, "coder_agent_url", None),
+            prompt=self._revision_prompt(input_text, draft, critique),
         )
-        invariant_task = asyncio.create_task(
-            self._run_stage(
-                role="invariant_programmer",
-                url=getattr(self.config, "coder_agent_url", None),
-                prompt=self._solver_prompt(input_text, plan, "invariant"),
-            )
+        revised = self._clean_code(revised_raw or "")
+
+        # Optional final safety critique only when there are mechanical issues or obvious dangerous
+        # patterns.  Avoid an unconditional extra rewrite, which previously hurt both correctness and
+        # safety by changing good code.
+        if self._is_acceptable(revised):
+            return revised
+        if self._is_acceptable(draft):
+            return draft
+
+        # Small mechanical repair if both failed. This is not a semantic safety gate.
+        base = self._least_bad([("revised", revised), ("draft", draft)])[1]
+        repaired_raw = await self._run_stage(
+            role="correctness_agent",
+            url=getattr(self.config, "coder_agent_url", None),
+            prompt=self._mechanical_repair_prompt(input_text, base, self._issues(base)),
         )
-        semantic_raw, invariant_raw = await asyncio.gather(semantic_task, invariant_task)
-
-        candidates = [
-            self._candidate("direct", direct_raw or "", input_text, plan),
-            self._candidate("semantic", semantic_raw or "", input_text, plan),
-            self._candidate("invariant", invariant_raw or "", input_text, plan),
-        ]
-
-        # If a candidate is already excellent and the task is a simple read-only
-        # query, avoid arbiter drift. This is deliberately narrow: broad routing
-        # through a local selector caused regressions.
-        if self._very_simple_read_only(input_text, plan):
-            clean = [c for c in candidates if not c.issues and not c.hazards]
-            if clean:
-                clean.sort(key=lambda c: (-c.score, len(c.code)))
-                return clean[0].code
-
-        # Round 3: one correctness-oriented arbiter. It sees only compact issue
-        # metadata and candidate code; it is told to copy the best candidate unless
-        # a small, obvious merge is needed. This is the component that previously
-        # raised correctness, so keep it instead of brittle hard gating.
-        arbiter_raw = await self._run_stage(
-            role="arbiter",
-            url=None,
-            prompt=self._arbiter_prompt(input_text, plan, candidates),
-        )
-        arbiter = self._candidate("arbiter", arbiter_raw or "", input_text, plan)
-        if not arbiter.issues and not self._has_hard_hazard(arbiter.hazards):
-            return arbiter.code
-
-        # One minimal repair only for mechanical problems. Do not repair clean
-        # originals just because they may be semantically imperfect.
-        if arbiter.code.strip() and not self._fatal(arbiter.issues):
-            repaired_raw = await self._run_stage(
-                role="repair_agent",
-                url=getattr(self.config, "repair_agent_url", None),
-                prompt=self._repair_prompt(input_text, plan, arbiter),
-            )
-            repaired = self._candidate("repaired", repaired_raw or "", input_text, plan)
-            if not repaired.issues and not self._has_hard_hazard(repaired.hazards):
-                return repaired.code
-            candidates.append(repaired)
-
-        candidates.append(arbiter)
-        return self._best_candidate(candidates).code
+        repaired = self._clean_code(repaired_raw or "")
+        if self._is_acceptable(repaired):
+            return repaired
+        if base.strip() and not self._has_private_helper(base) and not self._syntax_error(base):
+            return base
+        return self._fallback_response()
 
     async def _role_response(self, input_text: str) -> str:
         response = await self.llm.complete(
             system_prompt=self.role.system_prompt,
             user_prompt=input_text,
         )
-        if self.role.name in {"planner", "task_analyst", "critic"}:
+        if self.role.name == "safety_agent":
             return self._normalize_json_response(response or "{}")
-        code = self._normalize_code(response or "")
-        code = self._extract_process_graph_source(code) or code
+        code = self._clean_code(response or "")
         return code or self._fallback_response()
 
     async def _run_stage(self, *, role: str, url: str | None, prompt: str) -> str:
@@ -174,457 +121,233 @@ class Agent:
                 return await self.messenger.talk_to_agent(prompt, url)
             except Exception as exc:
                 print(f"{role} delegation failed: {exc}")
-        role_spec = get_role(role)
+        spec = get_role(role)
         print(f"Calling LiteLLM model for {role}: {self.config.model_name or '<none configured>'}")
-        response = await self.llm.complete(
-            system_prompt=role_spec.system_prompt,
-            user_prompt=prompt,
-        )
-        return response or ("{}" if role in {"planner", "task_analyst", "critic"} else "")
+        return await self.llm.complete(system_prompt=spec.system_prompt, user_prompt=prompt) or ("{}" if role == "safety_agent" else "")
 
-    def _planner_prompt(self, input_text: str) -> str:
+    def _correctness_prompt(self, task: str) -> str:
         return "\n\n".join([
-            "Plan this MALT/NetArena NetworkX task. Return JSON only; no markdown, no prose, no code.",
-            "Be literal: extract only entities and operations stated in the task. Do not invent ids.",
-            "Classify read_only=false only when the requested final answer requires changing the graph state.",
-            "Schema:",
-            PLAN_SCHEMA,
-            f"Task:\n{input_text}",
+            "You are the CORRECTNESS agent. Produce the final answer as code only.",
+            "Goal: maximize benchmark correctness without using private helpers. Safety matters, but do not avoid necessary requested mutations.",
+            self._contract(),
+            self._graph_semantics(),
+            "Think through the task internally, then output only the code. Put any helper logic inside process_graph so the submitted code is self-contained.",
+            f"Task:\n{task}",
         ])
 
-    def _solver_prompt(self, input_text: str, plan: str, style: str) -> str:
-        style_text = {
-            "direct": (
-                "Solve directly from the user task. Use robust first-principles NetworkX code. "
-                "Do not overfit to the planner; this candidate should be independently correct."
-            ),
-            "semantic": (
-                "Prioritize hidden-test semantic correctness: identify exact names, types, attributes, "
-                "containment scopes, expected return type, and required state transition."
-            ),
-            "invariant": (
-                "Prioritize correctness under safety invariants: perform the required operation but keep "
-                "all unrelated nodes, edges, and attributes bit-for-bit unchanged."
-            ),
-        }[style]
+    def _safety_prompt(self, task: str, code: str, mechanical_issues: list[str]) -> str:
         return "\n\n".join([
-            "Return ONLY executable Python code defining process_graph(graph_data).",
-            self._contract_block(),
-            self._semantics_block(),
-            style_text,
-            "Use local helper functions when helpful, but keep the implementation focused and deterministic.",
-            "Important: many hidden tasks are simple. Prefer exact, small logic over broad generic rewriting.",
-            f"Planner JSON:\n{plan}",
-            f"Original task:\n{input_text}",
+            "You are the SAFETY agent reviewing a MALT NetworkX solution.",
+            "Return JSON only. Do not write replacement code.",
+            "Your job is to identify concrete issues that may reduce safety or cause runtime failure while preserving correctness. Do not object to a mutation if the task explicitly requires that mutation.",
+            "Focus on: private helper cheating; mutating graph_data; read-only tasks that mutate graph_copy; broad clear/remove/relabel/overwrite; .get on non-dict edge data; DiGraph-only traversal that will crash on undirected graphs; missing schema; raw graph return; missing node/entity crashes.",
+            "JSON schema: {\"read_only\": true/false, \"must_mutate\": true/false, \"fatal\": [strings], \"safety\": [strings], \"runtime\": [strings], \"correctness_risks\": [strings], \"revision_instructions\": [short concrete instructions]}.",
+            f"Mechanical issues already found:\n{json.dumps(mechanical_issues)}",
+            f"Task:\n{task}",
+            f"Code:\n{code}",
         ])
 
-    def _arbiter_prompt(self, input_text: str, plan: str, candidates: list[Candidate]) -> str:
-        ordered = sorted(candidates, key=lambda c: (-c.score, len(c.issues), len(c.hazards)))
-        payload = []
-        for i, c in enumerate(ordered):
-            payload.append({
-                "index": i,
-                "label": c.label,
-                "score": round(c.score, 2),
-                "contract_issues": list(c.issues),
-                "safety_hazards": list(c.hazards),
-                "code": c.code[:12000],
-            })
+    def _revision_prompt(self, task: str, draft: str, critique_json: str) -> str:
         return "\n\n".join([
-            "You are the final MALT arbiter. Return ONLY executable Python code defining process_graph(graph_data).",
-            self._contract_block(),
-            self._semantics_block(),
-            "Decision policy:",
-            "1. Prefer the candidate most likely to pass hidden correctness.",
-            "2. Prefer copying a strong candidate unchanged over rewriting it.",
-            "3. Only synthesize a small merge when a candidate has correct task logic but another has a better helper/return schema.",
-            "4. Preserve safety: read-only tasks leave graph_copy unchanged; mutation tasks change only explicit targets.",
-            "5. Never introduce broad deletes, clear(), relabeling, randomness, imports, subprocesses, files, or network calls.",
-            "6. Ensure every return is JSON-serializable and includes updated_graph node-link JSON.",
-            f"Planner JSON:\n{plan}",
-            f"Task:\n{input_text}",
-            "Candidate implementations:",
-            json.dumps(payload),
+            "You are the CORRECTNESS agent revising after a SAFETY review. Return code only.",
+            "Preserve the draft's algorithm whenever it is semantically correct. Make the smallest changes needed to fix real safety/runtime/schema issues. Do not become conservative/no-op unless the task is truly read-only.",
+            self._contract(),
+            self._graph_semantics(),
+            f"Task:\n{task}",
+            f"Safety critique JSON:\n{critique_json}",
+            f"Draft code:\n{draft}",
         ])
 
-    def _repair_prompt(self, input_text: str, plan: str, candidate: Candidate) -> str:
+    def _mechanical_repair_prompt(self, task: str, code: str, issues: list[str]) -> str:
         return "\n\n".join([
-            "Repair the selected implementation with the smallest mechanical patch. Return code only.",
-            "Do not rewrite its algorithm unless needed to fix syntax, contract, serialization, or an explicit hard safety hazard.",
-            self._contract_block(),
-            self._semantics_block(),
-            f"Task:\n{input_text}",
-            f"Planner JSON:\n{plan}",
-            "Contract issues:",
-            json.dumps(list(candidate.issues)),
-            "Safety hazards:",
-            json.dumps(list(candidate.hazards)),
-            "Candidate code:",
-            candidate.code,
+            "Return only corrected executable Python code defining process_graph(graph_data).",
+            "Make the smallest repair for these mechanical issues. Preserve the algorithm and requested mutations.",
+            self._contract(),
+            self._graph_semantics(),
+            f"Task:\n{task}",
+            f"Issues:\n{json.dumps(issues)}",
+            f"Code:\n{code}",
         ])
 
-    def _contract_block(self) -> str:
-        return """Mandatory output contract:
-- Define exactly one public function: process_graph(graph_data).
-- Assume nx is already available; do not import anything.
-- The first graph operation must preserve input state: graph_copy = graph_data.copy().
-- Never mutate graph_data directly.
+    def _contract(self) -> str:
+        return """Mandatory contract:
+- Define exactly one top-level function: process_graph(graph_data). Do not import packages; nx is already available.
+- Start with graph_copy = graph_data.copy(). Never mutate graph_data.
+- Put helper functions inside process_graph, not at top level.
 - Every return path returns {'type': ..., 'data': ..., 'updated_graph': ...}.
-- updated_graph is nx.readwrite.json_graph.node_link_data(graph_copy).
-- If returning graph data in data, serialize it using node_link_data; never return a raw NetworkX graph object.
-- Missing entities must not raise; return a safe empty/unchanged result with the same schema."""
+- updated_graph must be nx.readwrite.json_graph.node_link_data(graph_copy).
+- Do not return raw NetworkX graph objects as data. Use strings/lists/tables or node-link JSON.
+- Missing requested entities must not crash; return the correct schema with empty/zero data and unchanged graph where appropriate.
+- Fully self-contained ordinary NetworkX/Python only. Do not call or reference hidden/private/oracle/reference/grader/benchmark helpers, especially names starting solid_step_, private_, oracle_, reference_, ground_truth_, expected_, benchmark_, grader_, or malt_."""
 
-    def _semantics_block(self) -> str:
-        return """MALT graph semantics:
-- Match nodes by id string and attrs: name, label, displayName, hostname, elementType, type, kind, class, role.
-- Normalize strings by lowercasing and stripping punctuation, spaces, hyphens, underscores, and the EK/RK prefixes for type/relationship matching.
-- Containment edges often use RK_CONTAINS or CONTAINS in relationship, rel, type, kind, name, or key. Support Graph, DiGraph, MultiGraph, and MultiDiGraph.
-- For under/in/within/contained-by scopes, traverse containment descendants from the scoped parent, then filter by requested type/name/attributes.
-- Deterministic output order: human name/label first, then node id string.
-- Read-only questions such as count/list/show/find/what/which/how many/rank/top/total/sum/average/path must compute only and leave graph_copy unchanged.
-- Mutation questions use explicit verbs such as add/create/update/set/change/remove/delete/move/connect/disconnect/attach/detach/fix/repair/configure/assign/place/allocate/modify. Mutate only the named or scoped targets.
-- Add/create: generate deterministic unique ids, infer elementType/type and containment edge style from similar siblings when possible, and add only required nodes/edges.
-- Update/set/change: modify only requested attributes on explicit target nodes/edges.
-- Remove/delete: remove only explicit targets; remove descendants only if asked for subtree/children/descendants/all under.
-- Capacity/bandwidth numeric attrs include physicalCapacity, capacity, bandwidth, bw, portCapacity, speed, availableBandwidth, usedBandwidth; parse numeric strings safely.
-- Preserve unrelated nodes, edges, and attributes exactly."""
+    def _graph_semantics(self) -> str:
+        return """Robust MALT graph semantics:
+- Normalize names/types by lowercase and removing spaces, punctuation, underscores, hyphens, and EK/RK prefixes.
+- Match nodes by id and attrs: name, label, displayName, title, hostname, elementType, type, kind, class, role, deviceType.
+- Node type attrs can be strings or lists; EK_SWITCH must match switch/ek switch/EK_SWITCH.
+- Edge data can be None, a string, a plain dict, or a dict-of-dicts for MultiGraphs. Before calling .get, check isinstance(x, dict). For dict-of-dicts, iterate values and only inspect dict values.
+- Containment edges usually have relationship/rel/type/kind/name/key/label equal to RK_CONTAINS or CONTAINS after normalization.
+- Support Graph, DiGraph, MultiGraph, and MultiDiGraph. For containment traversal, consider outgoing and incoming directions when methods exist; use neighbors for undirected graphs.
+- Scoped phrases such as in/under/within/below/contained by mean: find the scope node, traverse containment descendants, then filter by requested type/name/attributes.
+- Count/list/show/find/what/which/how many/rank/top/total/sum/average/path queries are read-only unless explicit mutation verbs appear: add/create/update/remove/delete/move/connect/fix/configure/place/assign/modify.
+- For read-only tasks, compute data only; leave graph_copy structurally and semantically unchanged.
+- For mutation tasks, perform the requested change exactly and minimally; preserve unrelated nodes, edges, and attributes.
+- Add/create: choose deterministic ids; set minimal name/type/elementType attributes; add only necessary containment/connectivity edges using existing edge style when inferable.
+- Update/set/change: change only requested attrs on requested nodes/edges. Remove/delete: remove exactly requested target; remove descendants only if prompt says subtree/children/descendants/all under.
+- Rank/top/aggregate: parse numeric strings safely; sort deterministically by value then name then id. Capacity-like attrs include physicalCapacity, capacity, bandwidth, bw, portCapacity, speed, availableBandwidth, usedBandwidth, totalCapacity.
+- Avoid clear(), graph-wide relabeling, graph-wide attribute overwrite, randomness, eval/exec, files, subprocesses, network calls, and grader introspection."""
 
-    def _candidate(self, label: str, raw: str, input_text: str, plan: str) -> Candidate:
-        code = self._normalize_code(raw or "")
-        code = self._extract_process_graph_source(code) or code
-        issues = tuple(self._static_issues(code))
-        hazards = tuple() if self._fatal(issues) else tuple(self._hazards(code, input_text, plan))
-        score = self._score(code, issues, hazards, input_text, plan)
-        return Candidate(label, code, issues, hazards, score)
+    def _clean_code(self, text: str) -> str:
+        s = self._strip_fences((text or "").strip())
+        if s.startswith("Answer:"):
+            s = s[len("Answer:"):].strip()
+        # The requested system wants one top-level process_graph. Keeping only that function is
+        # deliberate because prompts require nested helpers, which avoids top-level helper leakage.
+        extracted = self._extract_process_graph(s)
+        return extracted or s
 
-    def _score(self, code: str, issues: tuple[str, ...], hazards: tuple[str, ...], input_text: str, plan: str) -> float:
-        if not code.strip():
-            return -9999.0
-        score = 100.0
-        for issue in issues:
-            score -= 100 if self._fatal([issue]) else 25
-        for hazard in hazards:
-            score -= 80 if hazard.startswith("hard") else 8
-        # Useful but lightweight heuristics; avoid over-penalizing longer robust code.
-        for needle, bonus in {
-            "node_link_data": 8,
-            "graph_copy = graph_data.copy()": 8,
-            ".nodes(data=True)": 4,
-            "lower()": 3,
-            "sorted": 3,
-            "RK_CONTAINS": 4,
-            "CONTAINS": 3,
-            "is_multigraph": 3,
-            "successors": 2,
-            "predecessors": 2,
-            "def norm": 2,
-            "def normalize": 2,
-        }.items():
-            if needle in code:
-                score += bonus
-        if self._looks_read_only(input_text, plan) and not self._mutates_graph_copy(code):
-            score += 6
-        line_count = len(code.splitlines())
-        if 25 <= line_count <= 240:
-            score += 3
-        elif line_count > 320:
-            score -= min(20, (line_count - 320) / 12)
-        return score
+    def _strip_fences(self, text: str) -> str:
+        s = text.strip()
+        if s.startswith("```"):
+            lines = s.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "````":
+                lines = lines[:-1]
+            elif lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            s = "\n".join(lines).strip()
+        return s
 
-    def _best_candidate(self, candidates: list[Candidate]) -> Candidate:
-        def key(c: Candidate) -> tuple:
-            return (
-                self._fatal(c.issues),
-                self._has_hard_hazard(c.hazards),
-                len(c.issues),
-                len(c.hazards),
-                -c.score,
-                len(c.code),
-            )
-        viable = sorted(candidates, key=key)
-        return viable[0] if viable else Candidate("fallback", self._fallback_response(), tuple(), tuple(), -9999)
-
-    def _very_simple_read_only(self, input_text: str, plan: str) -> bool:
-        # Only bypass the arbiter for unmistakable simple queries where synthesis
-        # tends to introduce unnecessary mutations. Do not classify rank/top/path
-        # as simple because those often need careful semantics.
-        if not self._looks_read_only(input_text, plan):
-            return False
-        t = input_text.lower()
-        if re.search(r"\b(add|create|delete|remove|update|set|change|move|connect|disconnect|fix|repair|configure|assign|place|allocate|modify)\b", t):
-            return False
-        return bool(re.search(r"\b(count|how many|list|show|find|what|which|get|display)\b", t)) and not bool(re.search(r"\b(rank|top|bottom|path|shortest|longest|total|sum|average)\b", t))
-
-    def _looks_read_only(self, input_text: str, plan: str) -> bool:
-        data = self._extract_json(plan)
-        if isinstance(data, dict):
-            if data.get("must_mutate") is True:
-                return False
-            if data.get("read_only") is True:
-                return True
-        t = input_text.lower()
-        if re.search(r"\b(add|create|insert|delete|remove|update|set|change|rename|move|connect|disconnect|attach|detach|fix|repair|configure|assign|place|allocate|modify)\b", t):
-            return False
-        return bool(re.search(r"\b(count|how many|list|show|find|what|which|rank|top|bottom|total|sum|average|path|shortest|longest|get|display|return)\b", t))
-
-    def _hazards(self, code: str, input_text: str, plan: str) -> list[str]:
-        hazards: list[str] = []
+    def _extract_process_graph(self, text: str) -> str | None:
         try:
-            tree = ast.parse(code)
+            tree = ast.parse(text)
         except SyntaxError:
-            return hazards
-        func = self._process_graph_node(tree)
-        if func is None:
-            return hazards
-        read_only = self._looks_read_only(input_text, plan)
-        if read_only and self._mutates_graph_copy(code, func):
-            hazards.append("soft read-only mutation")
-        for node in ast.walk(func):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                root = self._root_name(node.func.value)
-                attr = node.func.attr
-                if root == "graph_copy" and attr in {"clear", "clear_edges"}:
-                    hazards.append("hard broad clear")
-                if root == "graph_copy" and attr in {"remove_nodes_from", "remove_edges_from"} and node.args:
-                    arg = ast.unparse(node.args[0]) if hasattr(ast, "unparse") else ""
-                    if "graph_copy.nodes" in arg or "graph_copy.edges" in arg or arg.strip().startswith("list(graph_copy"):
-                        hazards.append("hard broad removal")
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    target_txt = ast.unparse(target) if hasattr(ast, "unparse") else ""
-                    if target_txt == "graph_copy" and not self._is_graph_copy_assignment(node):
-                        hazards.append("hard replaces graph_copy")
-        if "nx.relabel" in code or "convert_node_labels_to_integers" in code:
-            hazards.append("hard broad relabel")
-        if "random." in code or "uuid" in code or "subprocess" in code or "open(" in code:
-            hazards.append("hard nondeterministic/external side effect")
-        return hazards
-
-    def _has_hard_hazard(self, hazards: tuple[str, ...] | list[str]) -> bool:
-        return any(h.startswith("hard") for h in hazards)
-
-    def _fatal(self, issues: tuple[str, ...] | list[str]) -> bool:
-        return any(i.startswith("SyntaxError") or "Missing process_graph" in i or "Empty code" in i for i in issues)
-
-    def _mutates_graph_copy(self, code: str, func: ast.FunctionDef | None = None) -> bool:
-        if func is None:
-            try:
-                tree = ast.parse(code)
-                func = self._process_graph_node(tree)
-            except SyntaxError:
-                return False
-        if func is None:
-            return False
-        mutating_methods = {
-            "add_node", "add_nodes_from", "add_edge", "add_edges_from", "remove_node", "remove_nodes_from",
-            "remove_edge", "remove_edges_from", "clear", "clear_edges", "update", "set_node_attributes",
-            "set_edge_attributes",
-        }
-        for node in ast.walk(func):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                attr = node.func.attr
-                root = self._root_name(node.func.value)
-                if attr in mutating_methods and (root == "graph_copy" or (attr.startswith("set_") and node.args and self._name_is(node.args[0], "graph_copy"))):
-                    return True
-            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    txt = ast.unparse(target) if hasattr(ast, "unparse") else ""
-                    if txt.startswith("graph_copy.nodes") or txt.startswith("graph_copy.edges") or txt.startswith("graph_copy["):
-                        return True
-        return False
-
-    def _static_issues(self, code: str) -> list[str]:
-        stripped = (code or "").strip()
-        issues: list[str] = []
-        if not stripped:
-            return ["Empty code response."]
-        if "```" in stripped:
-            issues.append("Code contains Markdown fences.")
-        if re.search(r"(^|\n)\s*(Here is|This code|Explanation:|Answer:)\b", stripped):
-            issues.append("Code contains prose outside the function.")
-        try:
-            tree = ast.parse(stripped)
-        except SyntaxError as exc:
-            return [f"SyntaxError: {exc.msg} at line {exc.lineno}."]
-        process_graph = self._process_graph_node(tree)
-        if process_graph is None:
-            return ["Missing process_graph(graph_data)."]
-        if len(process_graph.args.args) != 1 or process_graph.args.args[0].arg != "graph_data":
-            issues.append("process_graph must accept exactly one argument named graph_data.")
-        if any(isinstance(node, (ast.Import, ast.ImportFrom)) for node in ast.walk(tree)):
-            issues.append("Generated code should not import packages; nx is already available.")
-        if not self._uses_graph_copy(process_graph):
-            issues.append("Missing graph_copy = graph_data.copy().")
-        if self._mutates_graph_data(process_graph):
-            issues.append("Mutates graph_data directly instead of graph_copy.")
-        if "updated_graph" not in stripped:
-            issues.append("Missing updated_graph in return schema.")
-        if "node_link_data" not in stripped:
-            issues.append("Missing node-link JSON serialization.")
-        if re.search(r"return\s+graph_copy\b", stripped):
-            issues.append("Returns raw graph_copy instead of a result dictionary.")
-        if re.search(r"['\"]data['\"]\s*:\s*graph_copy\b", stripped):
-            issues.append("Returns raw NetworkX graph object in data.")
-        returns = self._process_graph_returns(process_graph)
-        if not returns:
-            issues.append("process_graph has no return path.")
-        for ret in returns:
-            issues.extend(self._return_schema_issues(ret.value))
-        return issues
-
-    def _process_graph_node(self, tree: ast.AST) -> ast.FunctionDef | None:
-        for node in getattr(tree, "body", []):
-            if isinstance(node, ast.FunctionDef) and node.name == "process_graph":
-                return node
-        return None
-
-    def _process_graph_returns(self, process_graph: ast.FunctionDef) -> list[ast.Return]:
-        class Collector(ast.NodeVisitor):
-            def __init__(self) -> None:
-                self.returns: list[ast.Return] = []
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-                if node is process_graph:
-                    self.generic_visit(node)
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-                return
-            def visit_Lambda(self, node: ast.Lambda) -> None:
-                return
-            def visit_Return(self, node: ast.Return) -> None:
-                self.returns.append(node)
-        collector = Collector()
-        collector.visit(process_graph)
-        return collector.returns
-
-    def _uses_graph_copy(self, process_graph: ast.FunctionDef) -> bool:
-        for node in ast.walk(process_graph):
-            if not isinstance(node, ast.Assign):
-                continue
-            if not any(isinstance(t, ast.Name) and t.id == "graph_copy" for t in node.targets):
-                continue
-            if self._is_graph_copy_assignment(node):
-                return True
-        return False
-
-    def _is_graph_copy_assignment(self, node: ast.Assign) -> bool:
-        v = node.value
-        return (
-            isinstance(v, ast.Call)
-            and isinstance(v.func, ast.Attribute)
-            and v.func.attr == "copy"
-            and isinstance(v.func.value, ast.Name)
-            and v.func.value.id == "graph_data"
-        )
-
-    def _mutates_graph_data(self, process_graph: ast.FunctionDef) -> bool:
-        mutating = {
-            "add_node", "add_nodes_from", "add_edge", "add_edges_from", "remove_node",
-            "remove_nodes_from", "remove_edge", "remove_edges_from", "clear", "clear_edges", "update",
-        }
-        for node in ast.walk(process_graph):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                if node.func.attr in mutating and self._root_name(node.func.value) == "graph_data":
-                    return True
-            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    txt = ast.unparse(target) if hasattr(ast, "unparse") else ""
-                    if txt.startswith("graph_data[") or txt.startswith("graph_data.nodes") or txt.startswith("graph_data.edges"):
-                        return True
-        return False
-
-    def _return_schema_issues(self, value: ast.AST | None) -> list[str]:
-        if not isinstance(value, ast.Dict):
-            return ["Return paths must return an explicit dictionary with type, data, and updated_graph."]
-        keys = {k.value for k in value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
-        missing = sorted({"type", "data", "updated_graph"} - keys)
-        issues = []
-        if missing:
-            issues.append(f"Return dictionary missing required key(s): {', '.join(missing)}.")
-        for key, item in zip(value.keys, value.values):
-            if isinstance(key, ast.Constant) and key.value == "data" and isinstance(item, ast.Name) and item.id == "graph_copy":
-                issues.append("Return dictionary uses raw graph_copy as data.")
-        return issues
-
-    def _root_name(self, node: ast.AST) -> str | None:
-        cur = node
-        while isinstance(cur, ast.Attribute):
-            cur = cur.value
-        if isinstance(cur, ast.Subscript):
-            cur = cur.value
-            while isinstance(cur, ast.Attribute):
-                cur = cur.value
-        if isinstance(cur, ast.Name):
-            return cur.id
-        return None
-
-    def _name_is(self, node: ast.AST, name: str) -> bool:
-        return isinstance(node, ast.Name) and node.id == name
-
-    def _extract_json(self, text: str | None) -> object | None:
-        if not text:
+            idx = text.find("def process_graph")
+            if idx >= 0:
+                candidate = text[idx:].strip()
+                try:
+                    ast.parse(candidate)
+                    return candidate
+                except SyntaxError:
+                    return None
             return None
-        normalized = self._strip_fences(text)
-        try:
-            return json.loads(normalized)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", normalized, re.DOTALL)
-            if not match:
-                return None
-            try:
-                return json.loads(match.group(0))
-            except json.JSONDecodeError:
-                return None
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "process_graph":
+                return ast.get_source_segment(text, node) or text
+        return None
 
     def _normalize_json_response(self, text: str) -> str:
         data = self._extract_json(text)
-        if data is None:
-            return "{}"
-        return json.dumps(data, separators=(",", ":"))
+        return json.dumps(data) if data is not None else "{}"
 
-    def _normalize_code(self, text: str) -> str:
-        stripped = (text or "").strip()
-        for prefix in ("Answer:", "Code:", "Python:"):
-            if stripped.startswith(prefix):
-                stripped = stripped[len(prefix):].strip()
-        return self._strip_fences(stripped)
-
-    def _strip_fences(self, text: str) -> str:
-        stripped = (text or "").strip()
-        if stripped.startswith("```"):
-            lines = stripped.splitlines()
-            if lines and lines[0].lstrip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            stripped = "\n".join(lines).strip()
-        return stripped
-
-    def _extract_process_graph_source(self, text: str) -> str | None:
-        stripped = self._strip_fences(text)
+    def _extract_json(self, text: str | None):
+        if not text:
+            return None
+        s = self._strip_fences(text)
         try:
-            tree = ast.parse(stripped)
-        except SyntaxError:
-            match = re.search(r"(^|\n)(def\s+process_graph\s*\(\s*graph_data\s*\)\s*:\n.*)", stripped, re.DOTALL)
-            if not match:
+            return json.loads(s)
+        except Exception:
+            m = re.search(r"\{.*\}", s, re.DOTALL)
+            if not m:
                 return None
-            candidate = match.group(2).rstrip()
             try:
-                ast.parse(candidate)
-                return candidate
-            except SyntaxError:
+                return json.loads(m.group(0))
+            except Exception:
                 return None
-        for node in getattr(tree, "body", []):
-            if isinstance(node, ast.FunctionDef) and node.name == "process_graph":
-                lines = stripped.splitlines()
-                if hasattr(node, "end_lineno") and node.end_lineno is not None:
-                    return "\n".join(lines[node.lineno - 1: node.end_lineno]).strip()
+
+    def _is_acceptable(self, code: str) -> bool:
+        return not self._issues(code)
+
+    def _least_bad(self, candidates: list[tuple[str, str]]) -> tuple[str, str]:
+        if not candidates:
+            return "fallback", self._fallback_response()
+        return sorted(candidates, key=lambda x: (len(self._issues(x[1])), self._has_private_helper(x[1]), self._syntax_error(x[1]), len(x[1])))[0]
+
+    def _issues(self, code: str) -> list[str]:
+        issues: list[str] = []
+        if not code or not code.strip():
+            return ["empty"]
+        if "```" in code:
+            issues.append("markdown fences")
+        if self._has_private_helper(code):
+            issues.append("private helper/oracle reference")
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return issues + [f"syntax error: {exc.msg}"]
+        top_funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        funcs = [n for n in top_funcs if n.name == "process_graph"]
+        if len(funcs) != 1:
+            issues.append("must define exactly one process_graph")
+            return issues
+        if len(top_funcs) != 1:
+            issues.append("top-level helper functions are not allowed; nest helpers inside process_graph")
+        func = funcs[0]
+        if len(func.args.args) != 1 or func.args.args[0].arg != "graph_data":
+            issues.append("process_graph must accept graph_data")
+        if any(isinstance(n, (ast.Import, ast.ImportFrom)) for n in ast.walk(tree)):
+            issues.append("imports are not allowed")
+        if not self._uses_graph_copy(func):
+            issues.append("missing graph_copy = graph_data.copy()")
+        if "updated_graph" not in code or "node_link_data" not in code:
+            issues.append("missing updated_graph node_link_data")
+        if re.search(r"graph_data\.(add|remove|clear|update)", code):
+            issues.append("mutates graph_data")
+        if re.search(r"\.clear\s*\(", code):
+            issues.append("clear() is unsafe")
+        if re.search(r"relabel_nodes|convert_node_labels", code):
+            issues.append("graph-wide relabeling is unsafe")
+        if any(isinstance(n, ast.Call) and self._call_name(n.func) in {"eval", "exec", "open", "compile", "__import__"} for n in ast.walk(tree)):
+            issues.append("unsafe builtin")
+        returns = [n for n in ast.walk(func) if isinstance(n, ast.Return)]
+        if not returns:
+            issues.append("no return")
+        for ret in returns:
+            if not isinstance(ret.value, ast.Dict):
+                issues.append("return must be dict")
+                continue
+            keys = {k.value for k in ret.value.keys if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            missing = {"type", "data", "updated_graph"} - keys
+            if missing:
+                issues.append("return dict missing " + ",".join(sorted(missing)))
+        return issues
+
+    def _syntax_error(self, code: str) -> bool:
+        try:
+            ast.parse(code)
+            return False
+        except SyntaxError:
+            return True
+
+    def _has_private_helper(self, code: str) -> bool:
+        return bool(PRIVATE_HELPER_RE.search(code or ""))
+
+    def _uses_graph_copy(self, func: ast.FunctionDef) -> bool:
+        for n in ast.walk(func):
+            if isinstance(n, ast.Assign):
+                if any(isinstance(t, ast.Name) and t.id == "graph_copy" for t in n.targets):
+                    v = n.value
+                    if (
+                        isinstance(v, ast.Call)
+                        and isinstance(v.func, ast.Attribute)
+                        and v.func.attr == "copy"
+                        and isinstance(v.func.value, ast.Name)
+                        and v.func.value.id == "graph_data"
+                    ):
+                        return True
+        return False
+
+    def _call_name(self, func: ast.AST) -> str | None:
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
         return None
 
     def _fallback_response(self) -> str:
         return "\n".join([
             "def process_graph(graph_data):",
             "    graph_copy = graph_data.copy()",
-            "    graph_json = nx.readwrite.json_graph.node_link_data(graph_copy)",
-            "    return {'type': 'graph', 'data': graph_json, 'updated_graph': graph_json}",
+            "    return {'type': 'text', 'data': '', 'updated_graph': nx.readwrite.json_graph.node_link_data(graph_copy)}",
         ])
