@@ -15,13 +15,18 @@ from roles import get_role
 
 
 PLAN_SCHEMA = """{
+  "task_summary": "one sentence",
   "read_only": true,
   "must_mutate": false,
-  "task_summary": "one sentence",
-  "targets": {"names": [], "types": [], "attributes": [], "scopes": []},
-  "operations": ["ordered atomic graph operations"],
-  "expected_return": {"type": "text|list|table|graph", "shape": "description"},
-  "safety_invariants": ["preserve unrelated graph state"]
+  "expected_return_type": "text | list | table | graph",
+  "entities": {
+    "names": ["explicit node names"],
+    "types": ["explicit EK_* or natural types"],
+    "attributes": ["explicit attributes"],
+    "scopes": ["parents / containers / query roots"]
+  },
+  "operations": ["ordered atomic state/action operations"],
+  "safety_invariants": ["preserve unrelated nodes, edges, attributes"]
 }"""
 
 
@@ -29,20 +34,21 @@ PLAN_SCHEMA = """{
 class Candidate:
     label: str
     code: str
-    static_issues: tuple[str, ...]
-    safety_notes: tuple[str, ...]
+    issues: tuple[str, ...]
+    hazards: tuple[str, ...]
     score: float
 
 
 class Agent:
-    """Diverse MALT agent optimized from observed regressions.
+    """Correctness-first MALT agent with lightweight safety discipline.
 
-    The best observed correctness came from diverse generation plus an arbiter. The
-    later regressions came from over-hard safety gates and too many repairs, which
-    filtered or rewrote semantically strong candidates. This version keeps the
-    correctness-producing diversity, makes safety a selector preference rather than
-    a brittle hard gate, and repairs only the selected code if it has concrete
-    contract/safety problems.
+    The observed peak came from diversity + an arbiter. Regressions came from
+    aggressive safety gating, over-selection, and gratuitous repairs that either
+    rejected correct programs or rewrote them into weaker code. This version
+    returns to the peak-producing topology: plan/direct in parallel, two planned
+    specialists in parallel, then one synthesis arbiter. Safety is handled mainly
+    by prompt discipline and only truly mechanical contract checks; the coordinator
+    does not second-guess graph semantics with brittle heuristics.
     """
 
     def __init__(self, config: AgentConfig | None = None):
@@ -55,7 +61,7 @@ class Agent:
         input_text = get_message_text(message)
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message(f"{self.role.name} is generating benchmark code..."),
+            new_agent_text_message(f"{self.role.name} is solving the graph task..."),
         )
         result = await self._respond(input_text)
         await updater.complete(new_agent_text_message(result))
@@ -69,8 +75,9 @@ class Agent:
         return await self._role_response(input_text)
 
     async def _coordinate(self, input_text: str) -> str:
-        # Planner + direct solver in parallel keeps latency down and gives one
-        # candidate that is not over-conditioned by a potentially imperfect plan.
+        # Round 1: get a compact semantic plan while also producing an
+        # independent direct implementation. The direct candidate often wins
+        # when the plan is slightly wrong.
         plan_task = asyncio.create_task(
             self._run_stage(
                 role="task_analyst",
@@ -88,67 +95,74 @@ class Agent:
         plan_raw, direct_raw = await asyncio.gather(plan_task, direct_task)
         plan = self._normalize_json_response(plan_raw or "{}")
 
-        specs = [
-            ("direct", direct_raw or ""),
-        ]
-
-        # Three complementary candidates recover the correctness gains seen in the
-        # 0.857 run, but without the expensive repair-all loop that hurt safety.
-        jobs = [
-            self._run_stage(
-                role="graph_programmer",
-                url=getattr(self.config, "coder_agent_url", None),
-                prompt=self._solver_prompt(input_text, plan, "general"),
-            ),
+        # Round 2: two complementary planned solvers. These are parallel to keep
+        # latency close to the previous high-performing version.
+        semantic_task = asyncio.create_task(
             self._run_stage(
                 role="semantic_programmer",
                 url=getattr(self.config, "coder_agent_url", None),
                 prompt=self._solver_prompt(input_text, plan, "semantic"),
-            ),
+            )
+        )
+        invariant_task = asyncio.create_task(
             self._run_stage(
                 role="invariant_programmer",
                 url=getattr(self.config, "coder_agent_url", None),
                 prompt=self._solver_prompt(input_text, plan, "invariant"),
-            ),
-        ]
-        generated = await asyncio.gather(*jobs)
-        specs.extend((label, raw or "") for label, raw in zip(["general", "semantic", "invariant"], generated))
-
-        read_only_hint = self._read_only_hint(input_text, plan)
-        candidates = [self._make_candidate(label, raw, input_text, read_only_hint) for label, raw in specs]
-
-        # First let the LLM choose among existing candidates. This preserves the
-        # semantic boost from the arbiter while avoiding unsafe synthesized rewrites.
-        selected = await self._select_candidate(input_text, plan, candidates, read_only_hint)
-
-        # If the selected code is already valid, return it. Safety notes are soft
-        # unless they indicate concrete high-risk mutation; the hidden safety metric
-        # often rewards exact correct state, so over-filtering hurts both metrics.
-        if not selected.static_issues and not self._has_hard_safety_issue(selected.safety_notes):
-            return selected.code
-
-        # Repair only the selected candidate, minimally. This restores contract
-        # compliance without rewriting every candidate and increasing variance.
-        repaired_raw = await self._run_stage(
-            role="repair_agent",
-            url=getattr(self.config, "repair_agent_url", None),
-            prompt=self._repair_prompt(input_text, plan, selected),
+            )
         )
-        repaired = self._make_candidate("selected_repaired", repaired_raw or "", input_text, read_only_hint)
-        if not repaired.static_issues and not self._has_hard_safety_issue(repaired.safety_notes):
-            return repaired.code
+        semantic_raw, invariant_raw = await asyncio.gather(semantic_task, invariant_task)
 
-        # Deterministic fallback selection: prefer executable, then high semantic
-        # score, then fewest safety concerns. This is intentionally not a hard gate.
-        viable = [c for c in candidates + [repaired] if not self._fatal_issues(c.static_issues)]
-        if viable:
-            viable.sort(key=lambda c: (self._has_hard_safety_issue(c.safety_notes), len(c.static_issues), -c.score, len(c.safety_notes)))
-            return viable[0].code
-        return self._fallback_response()
+        candidates = [
+            self._candidate("direct", direct_raw or "", input_text, plan),
+            self._candidate("semantic", semantic_raw or "", input_text, plan),
+            self._candidate("invariant", invariant_raw or "", input_text, plan),
+        ]
+
+        # If a candidate is already excellent and the task is a simple read-only
+        # query, avoid arbiter drift. This is deliberately narrow: broad routing
+        # through a local selector caused regressions.
+        if self._very_simple_read_only(input_text, plan):
+            clean = [c for c in candidates if not c.issues and not c.hazards]
+            if clean:
+                clean.sort(key=lambda c: (-c.score, len(c.code)))
+                return clean[0].code
+
+        # Round 3: one correctness-oriented arbiter. It sees only compact issue
+        # metadata and candidate code; it is told to copy the best candidate unless
+        # a small, obvious merge is needed. This is the component that previously
+        # raised correctness, so keep it instead of brittle hard gating.
+        arbiter_raw = await self._run_stage(
+            role="arbiter",
+            url=None,
+            prompt=self._arbiter_prompt(input_text, plan, candidates),
+        )
+        arbiter = self._candidate("arbiter", arbiter_raw or "", input_text, plan)
+        if not arbiter.issues and not self._has_hard_hazard(arbiter.hazards):
+            return arbiter.code
+
+        # One minimal repair only for mechanical problems. Do not repair clean
+        # originals just because they may be semantically imperfect.
+        if arbiter.code.strip() and not self._fatal(arbiter.issues):
+            repaired_raw = await self._run_stage(
+                role="repair_agent",
+                url=getattr(self.config, "repair_agent_url", None),
+                prompt=self._repair_prompt(input_text, plan, arbiter),
+            )
+            repaired = self._candidate("repaired", repaired_raw or "", input_text, plan)
+            if not repaired.issues and not self._has_hard_hazard(repaired.hazards):
+                return repaired.code
+            candidates.append(repaired)
+
+        candidates.append(arbiter)
+        return self._best_candidate(candidates).code
 
     async def _role_response(self, input_text: str) -> str:
-        response = await self.llm.complete(system_prompt=self.role.system_prompt, user_prompt=input_text)
-        if self.role.name in {"planner", "task_analyst", "critic", "arbiter"}:
+        response = await self.llm.complete(
+            system_prompt=self.role.system_prompt,
+            user_prompt=input_text,
+        )
+        if self.role.name in {"planner", "task_analyst", "critic"}:
             return self._normalize_json_response(response or "{}")
         code = self._normalize_code(response or "")
         code = self._extract_process_graph_source(code) or code
@@ -162,168 +176,186 @@ class Agent:
                 print(f"{role} delegation failed: {exc}")
         role_spec = get_role(role)
         print(f"Calling LiteLLM model for {role}: {self.config.model_name or '<none configured>'}")
-        response = await self.llm.complete(system_prompt=role_spec.system_prompt, user_prompt=prompt)
-        return response or ("{}" if role in {"planner", "task_analyst", "critic", "arbiter"} else "")
+        response = await self.llm.complete(
+            system_prompt=role_spec.system_prompt,
+            user_prompt=prompt,
+        )
+        return response or ("{}" if role in {"planner", "task_analyst", "critic"} else "")
 
     def _planner_prompt(self, input_text: str) -> str:
         return "\n\n".join([
-            "Plan this MALT NetworkX task as a NetArena state/action episode.",
-            "Return only JSON. Do not write code. Do not include markdown or prose.",
-            "Do not invent ids or facts. Classify read_only vs must_mutate carefully.",
+            "Plan this MALT/NetArena NetworkX task. Return JSON only; no markdown, no prose, no code.",
+            "Be literal: extract only entities and operations stated in the task. Do not invent ids.",
+            "Classify read_only=false only when the requested final answer requires changing the graph state.",
             "Schema:",
             PLAN_SCHEMA,
             f"Task:\n{input_text}",
         ])
 
     def _solver_prompt(self, input_text: str, plan: str, style: str) -> str:
-        style_lines = {
-            "direct": [
-                "Solve directly from the user task. Use the plan only if it is empty-safe; do not depend on it.",
-                "Favor a robust complete implementation with helpers.",
-            ],
-            "general": [
-                "Use the plan to implement the expected graph operations exactly.",
-                "Balance hidden-test correctness with minimal safe mutation.",
-            ],
-            "semantic": [
-                "Prioritize semantic correctness: exact entities, containment traversal, type normalization, and expected return shape.",
-                "Do not skip necessary mutations when the prompt explicitly asks for them.",
-            ],
-            "invariant": [
-                "Prioritize safety and invariants: preserve unrelated graph state and avoid broad graph operations.",
-                "Still perform the exact requested mutation if the task explicitly requires one.",
-            ],
+        style_text = {
+            "direct": (
+                "Solve directly from the user task. Use robust first-principles NetworkX code. "
+                "Do not overfit to the planner; this candidate should be independently correct."
+            ),
+            "semantic": (
+                "Prioritize hidden-test semantic correctness: identify exact names, types, attributes, "
+                "containment scopes, expected return type, and required state transition."
+            ),
+            "invariant": (
+                "Prioritize correctness under safety invariants: perform the required operation but keep "
+                "all unrelated nodes, edges, and attributes bit-for-bit unchanged."
+            ),
         }[style]
         return "\n\n".join([
-            "Return only executable Python code defining process_graph(graph_data). No imports, markdown, or explanation.",
+            "Return ONLY executable Python code defining process_graph(graph_data).",
             self._contract_block(),
-            self._malt_rules_block(),
-            *style_lines,
-            "Implementation advice: define local helper functions for normalize, node label/type matching, containment edge detection/traversal, numeric parsing, deterministic sort, and graph serialization when useful.",
-            "Use graph_copy = graph_data.copy() and never mutate graph_data.",
+            self._semantics_block(),
+            style_text,
+            "Use local helper functions when helpful, but keep the implementation focused and deterministic.",
+            "Important: many hidden tasks are simple. Prefer exact, small logic over broad generic rewriting.",
             f"Planner JSON:\n{plan}",
             f"Original task:\n{input_text}",
         ])
 
-    async def _select_candidate(self, input_text: str, plan: str, candidates: list[Candidate], read_only_hint: bool) -> Candidate:
-        ordered = sorted(candidates, key=lambda c: c.score, reverse=True)
-        summary = []
+    def _arbiter_prompt(self, input_text: str, plan: str, candidates: list[Candidate]) -> str:
+        ordered = sorted(candidates, key=lambda c: (-c.score, len(c.issues), len(c.hazards)))
+        payload = []
         for i, c in enumerate(ordered):
-            summary.append({
+            payload.append({
                 "index": i,
                 "label": c.label,
                 "score": round(c.score, 2),
-                "static_issues": list(c.static_issues),
-                "safety_notes": list(c.safety_notes),
-                "code": c.code[:9000],
+                "contract_issues": list(c.issues),
+                "safety_hazards": list(c.hazards),
+                "code": c.code[:12000],
             })
-        prompt = "\n\n".join([
-            "Choose the best existing implementation. Return JSON only: {\"best_index\": <int>, \"reason\": \"short\"}.",
-            "Prioritize hidden benchmark correctness, then safety/minimal mutation, then contract compliance. Do not synthesize code.",
-            f"Read-only hint: {read_only_hint}",
-            f"Task:\n{input_text}",
+        return "\n\n".join([
+            "You are the final MALT arbiter. Return ONLY executable Python code defining process_graph(graph_data).",
+            self._contract_block(),
+            self._semantics_block(),
+            "Decision policy:",
+            "1. Prefer the candidate most likely to pass hidden correctness.",
+            "2. Prefer copying a strong candidate unchanged over rewriting it.",
+            "3. Only synthesize a small merge when a candidate has correct task logic but another has a better helper/return schema.",
+            "4. Preserve safety: read-only tasks leave graph_copy unchanged; mutation tasks change only explicit targets.",
+            "5. Never introduce broad deletes, clear(), relabeling, randomness, imports, subprocesses, files, or network calls.",
+            "6. Ensure every return is JSON-serializable and includes updated_graph node-link JSON.",
             f"Planner JSON:\n{plan}",
-            "Candidates in ranked order:",
-            json.dumps(summary),
+            f"Task:\n{input_text}",
+            "Candidate implementations:",
+            json.dumps(payload),
         ])
-        response = await self._run_stage(role="critic", url=None, prompt=prompt)
-        data = self._extract_json(response)
-        if isinstance(data, dict):
-            try:
-                idx = int(data.get("best_index"))
-                if 0 <= idx < len(ordered):
-                    return ordered[idx]
-            except Exception:
-                pass
-        return ordered[0]
 
     def _repair_prompt(self, input_text: str, plan: str, candidate: Candidate) -> str:
         return "\n\n".join([
-            "Repair this selected MALT implementation with the smallest necessary patch. Return only code.",
-            "Do not rewrite a sound algorithm. Fix only concrete issues listed below.",
+            "Repair the selected implementation with the smallest mechanical patch. Return code only.",
+            "Do not rewrite its algorithm unless needed to fix syntax, contract, serialization, or an explicit hard safety hazard.",
             self._contract_block(),
-            self._malt_rules_block(),
+            self._semantics_block(),
             f"Task:\n{input_text}",
             f"Planner JSON:\n{plan}",
-            "Static issues:",
-            json.dumps(list(candidate.static_issues)),
-            "Safety notes:",
-            json.dumps(list(candidate.safety_notes)),
+            "Contract issues:",
+            json.dumps(list(candidate.issues)),
+            "Safety hazards:",
+            json.dumps(list(candidate.hazards)),
             "Candidate code:",
             candidate.code,
         ])
 
     def _contract_block(self) -> str:
-        return """Mandatory contract:
-- Define process_graph(graph_data) only.
-- Assume nx is available; do not import anything.
-- Start by copying: graph_copy = graph_data.copy().
+        return """Mandatory output contract:
+- Define exactly one public function: process_graph(graph_data).
+- Assume nx is already available; do not import anything.
+- The first graph operation must preserve input state: graph_copy = graph_data.copy().
 - Never mutate graph_data directly.
-- Return {'type': ..., 'data': ..., 'updated_graph': ...} on every path.
-- updated_graph must be nx.readwrite.json_graph.node_link_data(graph_copy).
-- Never return a raw NetworkX graph object in data; graph data must be node-link JSON.
-- Missing requested entities should not raise exceptions."""
+- Every return path returns {'type': ..., 'data': ..., 'updated_graph': ...}.
+- updated_graph is nx.readwrite.json_graph.node_link_data(graph_copy).
+- If returning graph data in data, serialize it using node_link_data; never return a raw NetworkX graph object.
+- Missing entities must not raise; return a safe empty/unchanged result with the same schema."""
 
-    def _malt_rules_block(self) -> str:
-        return """MALT graph rules:
-- Match by node id and attrs: name, label, displayName, hostname, elementType, type, kind, class, role.
-- Normalize type strings by lowercasing and removing ek/punctuation/spaces/underscores/hyphens.
-- Containment edges are usually RK_CONTAINS/CONTAINS in relationship/rel/type/kind/name/key; support Graph/DiGraph/MultiGraph.
-- For scoped queries, traverse containment descendants and filter by requested type/name/attrs.
-- Read-only tasks (count/list/show/find/what/which/how many/rank/top/total/sum/average/path) should not mutate graph_copy.
-- Mutation tasks require explicit change verbs; mutate only explicit target/scope and preserve unrelated state.
-- Add/create deterministic unique ids and minimal inferred attrs; update only requested attrs; delete only requested targets.
-- Sort deterministic outputs by human name then id. Ensure all data is JSON-serializable.
-- Avoid clear(), graph-wide relabeling, graph-wide attr updates, randomness, external files, subprocesses, and network calls."""
+    def _semantics_block(self) -> str:
+        return """MALT graph semantics:
+- Match nodes by id string and attrs: name, label, displayName, hostname, elementType, type, kind, class, role.
+- Normalize strings by lowercasing and stripping punctuation, spaces, hyphens, underscores, and the EK/RK prefixes for type/relationship matching.
+- Containment edges often use RK_CONTAINS or CONTAINS in relationship, rel, type, kind, name, or key. Support Graph, DiGraph, MultiGraph, and MultiDiGraph.
+- For under/in/within/contained-by scopes, traverse containment descendants from the scoped parent, then filter by requested type/name/attributes.
+- Deterministic output order: human name/label first, then node id string.
+- Read-only questions such as count/list/show/find/what/which/how many/rank/top/total/sum/average/path must compute only and leave graph_copy unchanged.
+- Mutation questions use explicit verbs such as add/create/update/set/change/remove/delete/move/connect/disconnect/attach/detach/fix/repair/configure/assign/place/allocate/modify. Mutate only the named or scoped targets.
+- Add/create: generate deterministic unique ids, infer elementType/type and containment edge style from similar siblings when possible, and add only required nodes/edges.
+- Update/set/change: modify only requested attributes on explicit target nodes/edges.
+- Remove/delete: remove only explicit targets; remove descendants only if asked for subtree/children/descendants/all under.
+- Capacity/bandwidth numeric attrs include physicalCapacity, capacity, bandwidth, bw, portCapacity, speed, availableBandwidth, usedBandwidth; parse numeric strings safely.
+- Preserve unrelated nodes, edges, and attributes exactly."""
 
-    def _make_candidate(self, label: str, raw: str, input_text: str, read_only_hint: bool) -> Candidate:
+    def _candidate(self, label: str, raw: str, input_text: str, plan: str) -> Candidate:
         code = self._normalize_code(raw or "")
         code = self._extract_process_graph_source(code) or code
-        static = tuple(self._static_issues(code))
-        safety = tuple() if self._fatal_issues(static) else tuple(self._safety_notes(code, read_only_hint))
-        score = self._score(code, static, safety, input_text, read_only_hint)
-        return Candidate(label, code, static, safety, score)
+        issues = tuple(self._static_issues(code))
+        hazards = tuple() if self._fatal(issues) else tuple(self._hazards(code, input_text, plan))
+        score = self._score(code, issues, hazards, input_text, plan)
+        return Candidate(label, code, issues, hazards, score)
 
-    def _score(self, code: str, static: tuple[str, ...], safety: tuple[str, ...], input_text: str, read_only_hint: bool) -> float:
+    def _score(self, code: str, issues: tuple[str, ...], hazards: tuple[str, ...], input_text: str, plan: str) -> float:
         if not code.strip():
-            return -10000.0
+            return -9999.0
         score = 100.0
-        for issue in static:
-            score -= 90 if self._fatal_issues([issue]) else 28
-        for note in safety:
-            score -= 35 if self._hard_note(note) else 10
-        bonuses = {
+        for issue in issues:
+            score -= 100 if self._fatal([issue]) else 25
+        for hazard in hazards:
+            score -= 80 if hazard.startswith("hard") else 8
+        # Useful but lightweight heuristics; avoid over-penalizing longer robust code.
+        for needle, bonus in {
             "node_link_data": 8,
             "graph_copy = graph_data.copy()": 8,
-            ".nodes(data=True)": 5,
+            ".nodes(data=True)": 4,
             "lower()": 3,
-            "sorted": 4,
-            "RK_CONTAINS": 5,
+            "sorted": 3,
+            "RK_CONTAINS": 4,
             "CONTAINS": 3,
             "is_multigraph": 3,
             "successors": 2,
             "predecessors": 2,
             "def norm": 2,
             "def normalize": 2,
-        }
-        for needle, bonus in bonuses.items():
+        }.items():
             if needle in code:
                 score += bonus
-        if read_only_hint and not self._mutates_graph_copy(code):
-            score += 12
-        if not read_only_hint and self._mutates_graph_copy(code):
-            # Small bonus only: many mutation prompts need this, but the critic still decides.
+        if self._looks_read_only(input_text, plan) and not self._mutates_graph_copy(code):
+            score += 6
+        line_count = len(code.splitlines())
+        if 25 <= line_count <= 240:
             score += 3
-        lines = len(code.splitlines())
-        if 35 <= lines <= 210:
-            score += 3
-        elif lines > 260:
-            score -= min(25, (lines - 260) / 8)
-        if "except Exception" in code or "except:" in code:
-            score -= 5
+        elif line_count > 320:
+            score -= min(20, (line_count - 320) / 12)
         return score
 
-    def _read_only_hint(self, input_text: str, plan: str) -> bool:
+    def _best_candidate(self, candidates: list[Candidate]) -> Candidate:
+        def key(c: Candidate) -> tuple:
+            return (
+                self._fatal(c.issues),
+                self._has_hard_hazard(c.hazards),
+                len(c.issues),
+                len(c.hazards),
+                -c.score,
+                len(c.code),
+            )
+        viable = sorted(candidates, key=key)
+        return viable[0] if viable else Candidate("fallback", self._fallback_response(), tuple(), tuple(), -9999)
+
+    def _very_simple_read_only(self, input_text: str, plan: str) -> bool:
+        # Only bypass the arbiter for unmistakable simple queries where synthesis
+        # tends to introduce unnecessary mutations. Do not classify rank/top/path
+        # as simple because those often need careful semantics.
+        if not self._looks_read_only(input_text, plan):
+            return False
+        t = input_text.lower()
+        if re.search(r"\b(add|create|delete|remove|update|set|change|move|connect|disconnect|fix|repair|configure|assign|place|allocate|modify)\b", t):
+            return False
+        return bool(re.search(r"\b(count|how many|list|show|find|what|which|get|display)\b", t)) and not bool(re.search(r"\b(rank|top|bottom|path|shortest|longest|total|sum|average)\b", t))
+
+    def _looks_read_only(self, input_text: str, plan: str) -> bool:
         data = self._extract_json(plan)
         if isinstance(data, dict):
             if data.get("must_mutate") is True:
@@ -331,47 +363,48 @@ class Agent:
             if data.get("read_only") is True:
                 return True
         t = input_text.lower()
-        mutation = r"\b(add|create|insert|delete|remove|update|set|change|rename|move|connect|disconnect|attach|detach|fix|repair|configure|assign|place|allocate|modify)\b"
-        query = r"\b(count|how many|list|show|find|what|which|rank|top|bottom|most|least|total|sum|average|path|shortest|longest|return|get|display)\b"
-        if re.search(mutation, t):
+        if re.search(r"\b(add|create|insert|delete|remove|update|set|change|rename|move|connect|disconnect|attach|detach|fix|repair|configure|assign|place|allocate|modify)\b", t):
             return False
-        return bool(re.search(query, t))
+        return bool(re.search(r"\b(count|how many|list|show|find|what|which|rank|top|bottom|total|sum|average|path|shortest|longest|get|display|return)\b", t))
 
-    def _safety_notes(self, code: str, read_only_hint: bool) -> list[str]:
-        notes: list[str] = []
+    def _hazards(self, code: str, input_text: str, plan: str) -> list[str]:
+        hazards: list[str] = []
         try:
             tree = ast.parse(code)
         except SyntaxError:
-            return notes
+            return hazards
         func = self._process_graph_node(tree)
         if func is None:
-            return notes
-        if read_only_hint and self._mutates_graph_copy(code, func):
-            notes.append("read-only-hint mutation")
+            return hazards
+        read_only = self._looks_read_only(input_text, plan)
+        if read_only and self._mutates_graph_copy(code, func):
+            hazards.append("soft read-only mutation")
         for node in ast.walk(func):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 root = self._root_name(node.func.value)
                 attr = node.func.attr
                 if root == "graph_copy" and attr in {"clear", "clear_edges"}:
-                    notes.append("hard broad clear")
+                    hazards.append("hard broad clear")
                 if root == "graph_copy" and attr in {"remove_nodes_from", "remove_edges_from"} and node.args:
                     arg = ast.unparse(node.args[0]) if hasattr(ast, "unparse") else ""
                     if "graph_copy.nodes" in arg or "graph_copy.edges" in arg or arg.strip().startswith("list(graph_copy"):
-                        notes.append("hard broad removal")
+                        hazards.append("hard broad removal")
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    txt = ast.unparse(target) if hasattr(ast, "unparse") else ""
-                    if txt == "graph_copy" and not self._is_graph_copy_assignment(node):
-                        notes.append("hard replaces graph_copy")
+                    target_txt = ast.unparse(target) if hasattr(ast, "unparse") else ""
+                    if target_txt == "graph_copy" and not self._is_graph_copy_assignment(node):
+                        hazards.append("hard replaces graph_copy")
         if "nx.relabel" in code or "convert_node_labels_to_integers" in code:
-            notes.append("hard broad relabel")
-        return notes
+            hazards.append("hard broad relabel")
+        if "random." in code or "uuid" in code or "subprocess" in code or "open(" in code:
+            hazards.append("hard nondeterministic/external side effect")
+        return hazards
 
-    def _has_hard_safety_issue(self, notes: tuple[str, ...] | list[str]) -> bool:
-        return any(self._hard_note(n) for n in notes)
+    def _has_hard_hazard(self, hazards: tuple[str, ...] | list[str]) -> bool:
+        return any(h.startswith("hard") for h in hazards)
 
-    def _hard_note(self, note: str) -> bool:
-        return note.startswith("hard")
+    def _fatal(self, issues: tuple[str, ...] | list[str]) -> bool:
+        return any(i.startswith("SyntaxError") or "Missing process_graph" in i or "Empty code" in i for i in issues)
 
     def _mutates_graph_copy(self, code: str, func: ast.FunctionDef | None = None) -> bool:
         if func is None:
@@ -382,16 +415,16 @@ class Agent:
                 return False
         if func is None:
             return False
-        mutating = {
-            "add_node", "add_nodes_from", "add_edge", "add_edges_from",
-            "remove_node", "remove_nodes_from", "remove_edge", "remove_edges_from",
-            "clear", "clear_edges", "update", "set_node_attributes", "set_edge_attributes",
+        mutating_methods = {
+            "add_node", "add_nodes_from", "add_edge", "add_edges_from", "remove_node", "remove_nodes_from",
+            "remove_edge", "remove_edges_from", "clear", "clear_edges", "update", "set_node_attributes",
+            "set_edge_attributes",
         }
         for node in ast.walk(func):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 attr = node.func.attr
                 root = self._root_name(node.func.value)
-                if attr in mutating and (root == "graph_copy" or (attr.startswith("set_") and node.args and self._name_is(node.args[0], "graph_copy"))):
+                if attr in mutating_methods and (root == "graph_copy" or (attr.startswith("set_") and node.args and self._name_is(node.args[0], "graph_copy"))):
                     return True
             if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -436,12 +469,9 @@ class Agent:
         returns = self._process_graph_returns(process_graph)
         if not returns:
             issues.append("process_graph has no return path.")
-        for return_node in returns:
-            issues.extend(self._return_schema_issues(return_node.value))
+        for ret in returns:
+            issues.extend(self._return_schema_issues(ret.value))
         return issues
-
-    def _fatal_issues(self, issues: tuple[str, ...] | list[str]) -> bool:
-        return any(issue.startswith("SyntaxError") or "Missing process_graph" in issue or "Empty code" in issue for issue in issues)
 
     def _process_graph_node(self, tree: ast.AST) -> ast.FunctionDef | None:
         for node in getattr(tree, "body", []):
