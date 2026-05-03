@@ -76,7 +76,29 @@ jobs:
           fi
           echo "Starting agent container from $IMAGE_TAG"
           docker run -d -p 9009:9009 --name agent-container --env-file .env "$IMAGE_TAG" --host 0.0.0.0 --port 9009
-          timeout 30 bash -c 'until curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null; do sleep 1; done'
+          for attempt in $(seq 1 120); do
+            if curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null; then
+              echo "Agent card is reachable."
+              break
+            fi
+            if ! docker ps --filter name=agent-container --format '{{.Names}}' | grep -qx agent-container; then
+              echo "Agent container exited before becoming ready." >&2
+              docker ps -a --filter name=agent-container
+              docker logs agent-container || true
+              exit 1
+            fi
+            if [ "$attempt" -eq 1 ] || [ $((attempt % 15)) -eq 0 ]; then
+              echo "Waiting for agent card... ${attempt}s"
+              docker logs --tail 80 agent-container || true
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:9009/.well-known/agent-card.json > /dev/null || {
+            echo "Agent did not become ready within 120 seconds." >&2
+            docker ps -a --filter name=agent-container
+            docker logs agent-container || true
+            exit 1
+          }
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v4
