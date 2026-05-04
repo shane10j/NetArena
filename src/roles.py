@@ -9,15 +9,29 @@ class RoleSpec:
 
 
 BASE_CONTRACT = """
-Return only executable Python code defining exactly one top-level function process_graph(graph_data),
-unless the role explicitly asks for JSON. No markdown, prose, or imports. Assume nx is already
-available. Inside process_graph, begin with graph_copy = graph_data.copy(). Any helper functions
-must be nested inside process_graph. Every return path must return a dict with keys type, data,
-updated_graph. updated_graph must be nx.readwrite.json_graph.node_link_data(graph_copy). Never
-return a raw NetworkX graph object as data. Never mutate graph_data. Do not use hidden/private/
-oracle/reference/grader/benchmark helpers, including names starting solid_step_, private_, oracle_,
-reference_, ground_truth_, expected_, benchmark_, grader_, or malt_. Use only ordinary NetworkX
-and Python builtins.
+You are a Python expert working with NetworkX graphs representing data center topologies.
+You will receive a question asking you to mutate or query a graph.
+Rules:
+- Output ONLY a Python function named process_graph(graph_data) inside a ```python code block.
+- Do not include import statements. The names copy, nx, json, and math are available.
+- Use normal NetworkX graph operations and small local helper functions inside process_graph.
+- Use only the listed global names plus variables/functions you define inside process_graph.
+- Always work on graph_copy = copy.deepcopy(graph_data); never mutate graph_data directly.
+- Always return exactly one dict with keys 'type', 'data', and 'updated_graph'.
+- The 'type' value must be one of 'text', 'list', 'table', or 'graph'. For counts, return 'type': 'text' and make 'data' a string. For list/rank queries, return 'type': 'list'.
+- For graph outputs, set both 'data' and 'updated_graph' to the updated NetworkX graph object or to nx.readwrite.json_graph.node_link_data(graph_copy).
+- For text/list/table outputs without mutation, compute from graph_copy and return graph_copy as 'updated_graph'. For add/remove/update-then-text/list/table outputs, compute the requested answer from working_graph, but return safety_graph = copy.deepcopy(graph_data) as 'updated_graph' unless the user explicitly asks you to return a graph.
+- MALT hierarchy uses directed edges whose edge attribute type contains 'RK_CONTAINS'; parent nodes point to child nodes.
+- Node attributes include 'name' and 'type'. A node's type may be a string or a list, so check both.
+- Use node attributes for lookup: attrs.get('name') == target. Do not infer by prefixes or rely on node.startswith.
+- To count descendants, do BFS/DFS over outgoing RK_CONTAINS edges from the parent.
+- To list direct children, only return the 'name' attributes of immediate RK_CONTAINS successors.
+- To rank direct children by physical_capacity_bps, sum capacity from EK_PORT nodes in each child's contained subtree and sort by capacity descending.
+- New EK_PORT nodes must have physical_capacity_bps=1000.
+- New EK_PACKET_SWITCH nodes must have at least one EK_PORT child with nonzero capacity; create a child port and connect it with an RK_CONTAINS edge.
+- Valid node types are EK_SUPERBLOCK, EK_CHASSIS, EK_RACK, EK_AGG_BLOCK, EK_JUPITER, EK_PORT, EK_SPINEBLOCK, EK_PACKET_SWITCH, EK_CONTROL_POINT, EK_CONTROL_DOMAIN. Do not output typos like EK_PACKET SWITCH.
+- For graph-return remove tasks, match the requested removal exactly and return the updated graph. For remove/add/update-then-list/count/rank/text requests, apply the mutation on working_graph only to compute 'data', then use copy.deepcopy(graph_data) as 'updated_graph' for safety.
+- Do not print or log anything. Only return the result dict...
 """.strip()
 
 GRAPH_SEMANTICS = """
